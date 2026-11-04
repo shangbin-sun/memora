@@ -1,0 +1,28 @@
+[package]
+name = "memora-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "HTTP server and Web UI for the Memora memory engine"
+publish = false
+
+[[bin]]
+name = "memora-server"
+path = "src/main.rs"
+
+[dependencies]
+memora = { path = ".." }
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+mime_guess = "2"
+regex = "1"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde"] }

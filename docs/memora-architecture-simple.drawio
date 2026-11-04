@@ -1,0 +1,150 @@
+<mxfile host="65bd71144e">
+    <diagram id="memora-arch-simple" name="Memora 架构（精简）">
+        <mxGraphModel dx="1484" dy="907" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1280" pageHeight="800" background="#F7F4EF" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="2" value="" style="rounded=0;whiteSpace=wrap;html=1;strokeColor=none;" vertex="1" parent="1">
+                    <mxGeometry x="110" y="80" width="950" height="630" as="geometry"/>
+                </mxCell>
+                <mxCell id="title" value="Memory · 系统端侧架构" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontSize=26;fontStyle=1;fontColor=#2A2118;fontFamily=Helvetica;" parent="1" vertex="1">
+                    <mxGeometry y="110" width="1200" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="engine" value="MemoryEngine&#xa;remember · recall · revise · forget · tick · dream · export/import" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D4A574;fontColor=#2A1C12;strokeColor=#8A5A3A;fontStyle=1;fontSize=13;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="180" y="170" width="820" height="56" as="geometry"/>
+                </mxCell>
+                <mxCell id="mech1" value="写入巩固&#xa;&#xa;STM 工作集&#xa;+ LTM（待巩固）&#xa;&#xa;dream 批分类&#xa;→ 聚类摘要 / 规律" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEF4E8;strokeColor=#8EA37A;strokeWidth=2;fontSize=12;fontColor=#2A2118;verticalAlign=top;spacingTop=8;" parent="1" vertex="1">
+                    <mxGeometry x="180" y="271" width="191" height="130" as="geometry"/>
+                </mxCell>
+                <mxCell id="mech1h" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8EA37A;strokeColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="190" y="270" width="170" height="8" as="geometry"/>
+                </mxCell>
+                <mxCell id="mech2" value="混合召回&lt;br&gt;&lt;br&gt;STM + FTS + HNSW&lt;br&gt;并行检索多路召回&lt;br&gt;&lt;br&gt;RRF 融合 → 衰减重排&lt;br&gt;→ ContextPack" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FBF3EB;strokeColor=#E0A070;strokeWidth=2;fontSize=12;fontColor=#2A2118;verticalAlign=top;spacingTop=8;" parent="1" vertex="1">
+                    <mxGeometry x="400" y="270" width="190" height="130" as="geometry"/>
+                </mxCell>
+                <mxCell id="mech2h" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0A070;strokeColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="410" y="270" width="170" height="8" as="geometry"/>
+                </mxCell>
+                <mxCell id="mech3" value="维护演进&#xa;&#xa;tick：沉淀 / 复习&#xa;遗忘衰减&#xa;&#xa;archived → forgotten&#xa;→ 到期物理删除" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8ECE8;strokeColor=#C9897A;strokeWidth=2;fontSize=12;fontColor=#2A2118;verticalAlign=top;spacingTop=8;" parent="1" vertex="1">
+                    <mxGeometry x="610" y="271" width="180" height="130" as="geometry"/>
+                </mxCell>
+                <mxCell id="mech3h" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C9897A;strokeColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="621" y="270" width="159" height="8" as="geometry"/>
+                </mxCell>
+                <mxCell id="mech4" value="可插拔能力&lt;br&gt;&lt;br&gt;Embedder&lt;br&gt;Summarizer&lt;br&gt;Classifier&lt;br&gt;&lt;br&gt;默认VLLM" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEF5EF;strokeColor=#6B9B7A;strokeWidth=2;fontSize=12;fontColor=#2A2118;verticalAlign=top;spacingTop=8;" parent="1" vertex="1">
+                    <mxGeometry x="820" y="271" width="171" height="130" as="geometry"/>
+                </mxCell>
+                <mxCell id="mech4h" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#6B9B7A;strokeColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="830" y="270" width="150" height="8" as="geometry"/>
+                </mxCell>
+                <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#D4A574;strokeWidth=1.5;endArrow=block;endFill=1;" parent="1" source="engine" target="mech1" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#D4A574;strokeWidth=1.5;endArrow=block;endFill=1;" parent="1" source="engine" target="mech2" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#D4A574;strokeWidth=1.5;endArrow=block;endFill=1;" parent="1" source="engine" target="mech3" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#D4A574;strokeWidth=1.5;endArrow=block;endFill=1;" parent="1" source="engine" target="mech4" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="storeBox" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF0F6;strokeColor=#5B7C99;strokeWidth=2;" parent="1" vertex="1">
+                    <mxGeometry x="177" y="447" width="814" height="130" as="geometry"/>
+                </mxCell>
+                <mxCell id="storeT" value="存储层" style="text;html=1;strokeColor=none;fillColor=none;align=left;fontStyle=1;fontSize=13;fontColor=#3A5570;" parent="1" vertex="1">
+                    <mxGeometry x="187" y="457" width="104" height="24" as="geometry"/>
+                </mxCell>
+                <mxCell id="stm" value="STM&#xa;moka 工作集" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8EA37A;fontColor=#FFFFFF;strokeColor=#5A7048;fontStyle=1;fontSize=13;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="194" y="497" width="164" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="sqlite" value="SQLite&#xa;事实源 · FTS · 审计" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#5B7C99;fontColor=#FFFFFF;strokeColor=#3A5570;fontStyle=1;fontSize=13;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="383" y="487" width="184" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="hnsw" value="HNSW&#xa;向量检索索引" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#E0A070;fontColor=#2A1C12;strokeColor=#9A5A30;fontStyle=1;fontSize=13;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="597" y="487" width="184" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="zip" value="离线记忆&lt;br&gt;导入 / 导出" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#A67C52;fontColor=#FFFFFF;strokeColor=#6E5238;fontStyle=1;fontSize=13;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="807" y="497" width="164" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="lifeT" value="生命周期" style="text;html=1;strokeColor=none;fillColor=none;align=left;fontStyle=1;fontSize=12;fontColor=#8A5A3A;" parent="1" vertex="1">
+                    <mxGeometry x="180" y="600" width="100" height="22" as="geometry"/>
+                </mxCell>
+                <mxCell id="lc1" value="写入 pending" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8EA37A;fontColor=#FFFFFF;strokeColor=#5A7048;fontStyle=1;fontSize=11;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="190" y="630" width="100" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="lc2" value="巩固 active" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5B8FA8;fontColor=#FFFFFF;strokeColor=#3A6A80;fontStyle=1;fontSize=11;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="350" y="630" width="100" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="lc3" value="archived" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0A070;fontColor=#2A1C12;strokeColor=#9A5A30;fontStyle=1;fontSize=11;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="500" y="630" width="89" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="lc4" value="forgotten" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C9897A;fontColor=#FFFFFF;strokeColor=#8A5040;fontStyle=1;fontSize=11;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="650" y="630" width="90" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="lc5" value="DELETE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#6E5238;fontColor=#FFFFFF;strokeColor=#4A3828;fontStyle=1;fontSize=11;shadow=1;" parent="1" vertex="1">
+                    <mxGeometry x="810" y="630" width="100" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="a1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8A5A3A;strokeWidth=2;endArrow=block;endFill=1;" parent="1" source="lc1" target="lc2" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="a1l" value="dream" style="edgeLabel;html=1;align=center;fontSize=10;fontColor=#7A6E60;labelBackgroundColor=#F7F4EF;" parent="a1" vertex="1" connectable="0">
+                    <mxGeometry x="-0.2" relative="1" as="geometry">
+                        <mxPoint y="-10" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="a2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8A5A3A;strokeWidth=2;endArrow=block;endFill=1;" parent="1" source="lc2" target="lc3" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="a2l" value="衰减" style="edgeLabel;html=1;align=center;fontSize=10;fontColor=#7A6E60;labelBackgroundColor=#F7F4EF;" parent="a2" vertex="1" connectable="0">
+                    <mxGeometry x="-0.2" relative="1" as="geometry">
+                        <mxPoint y="-10" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="a3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8A5A3A;strokeWidth=2;endArrow=block;endFill=1;" parent="1" source="lc3" target="lc4" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="a3l" value="30天" style="edgeLabel;html=1;align=center;fontSize=10;fontColor=#7A6E60;labelBackgroundColor=#F7F4EF;" parent="a3" vertex="1" connectable="0">
+                    <mxGeometry x="-0.2" relative="1" as="geometry">
+                        <mxPoint y="-10" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="a4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8A5A3A;strokeWidth=2;endArrow=block;endFill=1;" parent="1" source="lc4" target="lc5" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="a4l" value="30天" style="edgeLabel;html=1;align=center;fontSize=10;fontColor=#7A6E60;labelBackgroundColor=#F7F4EF;" parent="a4" vertex="1" connectable="0">
+                    <mxGeometry x="-0.2" relative="1" as="geometry">
+                        <mxPoint y="-10" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="s1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8EA37A;strokeWidth=1.2;dashed=1;endArrow=block;endFill=1;opacity=70;" parent="1" source="mech1" target="stm" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="s2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#5B7C99;strokeWidth=1.2;dashed=1;endArrow=block;endFill=1;opacity=70;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" parent="1" source="mech1" target="sqlite" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="275" y="430"/>
+                            <mxPoint x="479" y="430"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="s3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#E0A070;strokeWidth=1.2;dashed=1;endArrow=block;endFill=1;opacity=70;" parent="1" source="mech2" target="hnsw" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="495" y="430"/>
+                            <mxPoint x="689" y="430"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="s4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#5B7C99;strokeWidth=1.2;dashed=1;endArrow=block;endFill=1;opacity=70;" parent="1" source="mech2" target="sqlite" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="495" y="430"/>
+                            <mxPoint x="479" y="430"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

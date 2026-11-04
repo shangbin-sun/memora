@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+*.db
+*.db-wal
+*.db-shm
+*.hnsw
+*.graph
+.DS_Store
+.env
+/data
+*.hnsw.data
+*.hnsw.graph
+/tests/eval_out
+/tests/eval_out_extract
+dist
+__pycache__
+
+# Generated Skill distribution artifacts
+/skills/memora-memory.zip
+/skills/memora-memory/memora-mcp
+/skills/memora-memory/memora-mcp.exe

@@ -1,0 +1,3 @@
+# Shell scripts must use LF for WSL/Linux execution
+*.sh text eol=lf
+scripts/* text eol=lf

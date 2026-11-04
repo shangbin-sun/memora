@@ -1,0 +1,378 @@
+<mxfile host="app.diagrams.net" agent="Cursor" version="22.1.0" type="device">
+  <diagram id="memora-arch" name="Memora 系统架构">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="2200" math="0" shadow="0" background="#F7F4EF">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="title" value="Memora · 本地优先记忆引擎架构" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontFamily=Helvetica;fontSize=28;fontStyle=1;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="40" y="30" width="1520" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="可嵌入 Rust 库（memora）+ 可选 HTTP/Web 宿主（memora-server）· 短期工作集 / 长期可检索记忆 / 巩固梦境 / 遗忘衰减 / 审计可追溯" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontFamily=Helvetica;fontSize=13;fontColor=#7A6E60;" vertex="1" parent="1">
+          <mxGeometry x="40" y="70" width="1520" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Layer 1: Host ========== -->
+        <mxCell id="L1" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F1F5;strokeColor=#5B8FA8;strokeWidth=2;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="120" width="1520" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="L1t" value="① 宿主层 Host" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontStyle=1;fontSize=14;fontColor=#3A6A80;" vertex="1" parent="1">
+          <mxGeometry x="55" y="125" width="200" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="host1" value="宿主应用&#xa;embedded crate&#xa;MemoryEngine::builder()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5B8FA8;fontColor=#FFFFFF;strokeColor=#3A6A80;strokeWidth=1;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="160" width="200" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="host2" value="memora-server&#xa;Axum HTTP + Web UI&#xa;:8787 /api/*" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5B8FA8;fontColor=#FFFFFF;strokeColor=#3A6A80;strokeWidth=1;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="320" y="160" width="200" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="host3" value="API 能力&#xa;remember · recall · revise&#xa;forget · explain · export/import&#xa;tick · dream · rebuild_index" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#5B8FA8;strokeWidth=1.5;fontSize=11;fontColor=#2A2118;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="155" width="280" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="host4" value="注入点（可选 LLM）&#xa;Embedder / Summarizer&#xa;MemoryClassifier&#xa;默认：Hash + Extractive + Heuristic&#xa;千帆：Qianfan*" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#5B8FA8;strokeWidth=1.5;fontSize=11;fontColor=#2A2118;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="880" y="150" width="280" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="host5" value="设计边界&#xa;· 库不强制 LLM&#xa;· 本地优先&#xa;· SQLite 事实源&#xa;· Token 预算 ContextPack" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D6E8F0;strokeColor=#5B8FA8;fontSize=11;fontColor=#2A2118;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="150" width="320" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Layer 2: Engine Core ========== -->
+        <mxCell id="L2" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8EFE3;strokeColor=#D4A574;strokeWidth=2;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="280" width="1520" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="L2t" value="② 引擎核心 MemoryEngine" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontStyle=1;fontSize=14;fontColor=#8A5A3A;" vertex="1" parent="1">
+          <mxGeometry x="55" y="285" width="280" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="eng" value="MemoryEngine / MemoryService&#xa;async API · spawn_blocking(DB/HNSW) · r2d2 池 · WAL" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D4A574;fontColor=#2A1C12;strokeColor=#8A5A3A;strokeWidth=1.5;fontStyle=1;fontSize=13;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="320" width="420" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="core" value="core/&#xa;R(t)·RRF·jieba·时间" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8C9A8;strokeColor=#8A5A3A;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="540" y="320" width="160" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="cfg" value="Config&#xa;阈值 / TTL / TopK" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8C9A8;strokeColor=#8A5A3A;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="730" y="320" width="140" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="types" value="types&#xa;kind / state / DTO" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8C9A8;strokeColor=#8A5A3A;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="900" y="320" width="140" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="err" value="error&#xa;统一 Result" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8C9A8;strokeColor=#8A5A3A;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="320" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ns" value="namespace&#xa;多租户隔离" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8C9A8;strokeColor=#8A5A3A;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="320" width="140" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="maint" value="spawn_maintenance&#xa;可选后台 tick" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8C9A8;strokeColor=#8A5A3A;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="320" width="140" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Layer 3: Three Paths ========== -->
+        <mxCell id="L3" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F6F0;strokeColor=#8EA37A;strokeWidth=2;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="420" width="1520" height="520" as="geometry" />
+        </mxCell>
+        <mxCell id="L3t" value="③ 三条主路径：写入巩固 · 混合召回 · 维护演进" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontStyle=1;fontSize=14;fontColor=#5A7048;" vertex="1" parent="1">
+          <mxGeometry x="55" y="425" width="480" height="24" as="geometry" />
+        </mxCell>
+
+        <!-- Write path column -->
+        <mxCell id="Wbox" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEF4E8;strokeColor=#8EA37A;strokeWidth=1.5;dashed=0;" vertex="1" parent="1">
+          <mxGeometry x="60" y="460" width="480" height="460" as="geometry" />
+        </mxCell>
+        <mxCell id="Wt" value="A. 写入 / 巩固路径" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontStyle=1;fontSize=13;fontColor=#5A7048;" vertex="1" parent="1">
+          <mxGeometry x="60" y="468" width="480" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="w1" value="remember(content)&#xa;临时 kind/importance/confidence" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8EA37A;fontColor=#FFFFFF;strokeColor=#5A7048;fontStyle=1;fontSize=11;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="100" y="505" width="400" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="w2" value="STM 工作集&#xa;session 或 __default__&#xa;session_events / working_facts(pin)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#8EA37A;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="100" y="565" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="w3" value="LTM 立即入库&#xa;consolidation_pending=1&#xa;可检索 · 待巩固" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#8EA37A;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="310" y="565" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="w4" value="事务：memories + FTS + version(create)&#xa;+ audit + pattern_observations bump&#xa;+ embed 异步入队" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E4C8;strokeColor=#8EA37A;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="100" y="655" width="400" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="w5" value="dream() 前置巩固&#xa;Classifier 批处理 pending&#xa;更新 kind / 分值 · 低分归档&#xa;可选抽规律 Pattern" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#7D93B3;fontColor=#FFFFFF;strokeColor=#4A5F7A;fontStyle=1;fontSize=11;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="100" y="735" width="400" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="w6" value="聚类摘要 → semantic/summary&#xa;时间桶 ∩ Jaccard ∩ 余弦&#xa;derived_from / summarizes&#xa;规则 pattern_observations ≥5" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#7D93B3;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="100" y="825" width="400" height="75" as="geometry" />
+        </mxCell>
+
+        <!-- Recall path -->
+        <mxCell id="Rbox" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FBF3EB;strokeColor=#E0A070;strokeWidth=1.5;" vertex="1" parent="1">
+          <mxGeometry x="560" y="460" width="480" height="460" as="geometry" />
+        </mxCell>
+        <mxCell id="Rt" value="B. 混合召回路径" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontStyle=1;fontSize=13;fontColor=#9A5A30;" vertex="1" parent="1">
+          <mxGeometry x="560" y="468" width="480" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="r1" value="recall(query, top_k)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0A070;fontColor=#2A1C12;strokeColor=#9A5A30;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="600" y="505" width="400" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="r2" value="STM&#xa;working_facts&#xa;优先命中" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#8EA37A;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="600" y="565" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="r3" value="FTS5&#xa;jieba 预分词&#xa;BM25 Top80" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#5B8FA8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="740" y="565" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="r4" value="HNSW&#xa;Embedder 向量&#xa;L2 Top80" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#E0A070;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="880" y="565" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="r5" value="RRF 融合 k=60 → Top20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0D5B8;strokeColor=#9A5A30;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="600" y="645" width="400" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="r6" value="重排打分&#xa;final = rrf × confidence × R(t) × access_boost × importance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#9A5A30;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="600" y="700" width="400" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="r7" value="ContextPack（token 预算≈2000）&#xa;STM facts → Atomic → Summary/Semantic/Pattern&#xa;→ 沿 derived_from / summarizes 展开来源" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0A070;fontColor=#2A1C12;strokeColor=#9A5A30;fontStyle=1;fontSize=11;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="600" y="770" width="400" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="r8" value="输出 RecallResult&#xa;hits + stm_hits + context + ScoreBreakdown" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#9A5A30;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="600" y="860" width="400" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Maintenance path -->
+        <mxCell id="Mbox" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8ECE8;strokeColor=#C9897A;strokeWidth=1.5;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="460" width="480" height="460" as="geometry" />
+        </mxCell>
+        <mxCell id="Mt" value="C. 维护 / 遗忘 / 交换" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontStyle=1;fontSize=13;fontColor=#8A5040;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="468" width="480" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m1" value="tick()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C9897A;fontColor=#FFFFFF;strokeColor=#8A5040;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="505" width="180" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="m2" value="dream()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#7D93B3;fontColor=#FFFFFF;strokeColor=#4A5F7A;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="1320" y="505" width="180" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="m3" value="STM 沉淀&#xa;eviction → stm_promotions&#xa;→ remember(skip_consolidation)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#C9897A;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="560" width="400" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="m4" value="艾宾浩斯复习&#xa;S = S0(1+α·imp+β·reviews)&#xa;间隔 ≈ 1/3/7/16/35 天" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#C9897A;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="630" width="400" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="m5" value="生命周期&#xa;active →(R&lt;0.15) archived&#xa;→(+30d) forgotten →(+30d) DELETE&#xa;retain=true 可跳过" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0D5CC;strokeColor=#8A5040;fontSize=11;fontColor=#2A2118;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="705" width="400" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="m6" value="revise / forget / restore&#xa;版本链 + 矛盾边 contradicts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#C9897A;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="795" width="190" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="m7" value="exchange .memora ZIP&#xa;merge / dry_run / replace / reembed" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#A67C52;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1310" y="795" width="190" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="m8" value="audit_events 仅追加&#xa;hash = sha256(prev‖payload‖…)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#C9897A;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="870" width="400" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- arrows within write -->
+        <mxCell id="aw1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#5A7048;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="w1" target="w2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="aw2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#5A7048;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="w1" target="w3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="aw3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#5A7048;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="w3" target="w4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="aw4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#4A5F7A;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="w4" target="w5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="aw5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#4A5F7A;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="w5" target="w6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- recall arrows -->
+        <mxCell id="ar1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9A5A30;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="r1" target="r2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ar2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9A5A30;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="r1" target="r3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ar3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9A5A30;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="r1" target="r4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ar4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9A5A30;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="r2" target="r5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ar5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9A5A30;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="r3" target="r5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ar6" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9A5A30;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="r4" target="r5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ar7" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9A5A30;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="r5" target="r6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ar8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9A5A30;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="r6" target="r7">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ar9" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9A5A30;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1" source="r7" target="r8">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Layer 4: Storage ========== -->
+        <mxCell id="L4" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF0F6;strokeColor=#5B7C99;strokeWidth=2;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="970" width="1520" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="L4t" value="④ 存储与索引层（SQLite = 事实源 · HNSW = 可丢弃检索层）" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontStyle=1;fontSize=14;fontColor=#3A5570;" vertex="1" parent="1">
+          <mxGeometry x="55" y="975" width="600" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s1" value="SQLite WAL&#xa;r2d2 · busy_timeout&#xa;migration v1→v2" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#5B7C99;fontColor=#FFFFFF;strokeColor=#3A5570;fontStyle=1;fontSize=11;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1015" width="160" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="s2" value="memories&#xa;+ consolidation_pending&#xa;FTS5 · versions&#xa;relations · embeddings&#xa;audit · dream_runs&#xa;stm_promotions&#xa;pattern_observations" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#5B7C99;fontSize=10;fontColor=#2A2118;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="270" y="1015" width="220" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="s3" value="HNSW 文件&#xa;hnsw_rs&#xa;M=16 ef=64&#xa;rebuild_index()" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#E0A070;fontColor=#2A1C12;strokeColor=#9A5A30;fontStyle=1;fontSize=11;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="520" y="1015" width="150" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="s4" value="STM · moka 三区&#xa;session_events TTL 2h / 1024&#xa;working_facts TTL 3d / 256&#xa;query_cache TTL 15s / 256" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8EA37A;fontColor=#FFFFFF;strokeColor=#5A7048;fontSize=11;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="700" y="1015" width="260" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="s5" value="数据模型&#xa;id: UUIDv7&#xa;kind: episodic|semantic|pattern|summary&#xa;state: active|archived|forgotten|superseded&#xa;salience ≈ importance × confidence × R(t)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#5B7C99;fontSize=11;fontColor=#2A2118;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="990" y="1015" width="320" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="s6" value=".memora&#xa;ZIP 交换包&#xa;manifest + jsonl" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#A67C52;fontColor=#FFFFFF;strokeColor=#6E5238;fontSize=11;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="1030" width="180" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Layer 5: Traits ========== -->
+        <mxCell id="L5" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEF5EF;strokeColor=#6B9B7A;strokeWidth=2;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1200" width="1520" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="L5t" value="⑤ 可插拔能力（Trait 注入 · 默认零 LLM · 可选千帆）" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontStyle=1;fontSize=14;fontColor=#3F6B4C;" vertex="1" parent="1">
+          <mxGeometry x="55" y="1205" width="520" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="t1" value="Embedder&#xa;HashEmbedder&#xa;QianfanEmbedder" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#6B9B7A;fontColor=#FFFFFF;strokeColor=#3F6B4C;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1245" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="t2" value="Summarizer&#xa;ExtractiveSummarizer&#xa;QianfanSummarizer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#6B9B7A;fontColor=#FFFFFF;strokeColor=#3F6B4C;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="320" y="1245" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="t3" value="MemoryClassifier&#xa;HeuristicClassifier&#xa;QianfanClassifier" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#6B9B7A;fontColor=#FFFFFF;strokeColor=#3F6B4C;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="580" y="1245" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="t4" value="用途&#xa;Embedder → 召回向量 / 写入 embedding&#xa;Summarizer → dream 聚类摘要&#xa;Classifier → dream 批分类巩固" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#6B9B7A;fontSize=11;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="840" y="1245" width="340" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="t5" value="密钥仅环境变量&#xa;LLM_API_KEY&#xa;不写进仓库" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D8EBD9;strokeColor=#6B9B7A;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="1245" width="300" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- ========== Lifecycle strip ========== -->
+        <mxCell id="L6" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FBF6F0;strokeColor=#D4A574;strokeWidth=2;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1390" width="1520" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="L6t" value="⑥ 记忆生命周期（Lifecycle）" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontStyle=1;fontSize=14;fontColor=#8A5A3A;" vertex="1" parent="1">
+          <mxGeometry x="55" y="1395" width="320" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lc1" value="写入&#xa;pending" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8EA37A;fontColor=#FFFFFF;strokeColor=#5A7048;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1435" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lc2" value="巩固&#xa;active" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5B8FA8;fontColor=#FFFFFF;strokeColor=#3A6A80;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="280" y="1435" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lc3" value="派生&#xa;semantic/summary/pattern" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#7D93B3;fontColor=#FFFFFF;strokeColor=#4A5F7A;fontStyle=1;fontSize=11;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="480" y="1435" width="160" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lc4" value="archived&#xa;R&lt;0.15" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0A070;fontColor=#2A1C12;strokeColor=#9A5A30;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="720" y="1435" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lc5" value="forgotten&#xa;+30 天" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C9897A;fontColor=#FFFFFF;strokeColor=#8A5040;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="920" y="1435" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lc6" value="DELETE&#xa;再 +30 天" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#6E5238;fontColor=#FFFFFF;strokeColor=#4A3828;fontStyle=1;fontSize=12;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="1435" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lc7" value="随时&#xa;restore / purge" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#D4A574;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1320" y="1435" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="alc1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8A5A3A;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="lc1" target="lc2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="alc1l" value="dream 分类" style="edgeLabel;html=1;align=center;fontSize=10;fontColor=#7A6E60;labelBackgroundColor=#F7F4EF;" vertex="1" connectable="0" parent="alc1">
+          <mxGeometry x="-0.1" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+        </mxCell>
+        <mxCell id="alc2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8A5A3A;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="lc2" target="lc3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="alc2l" value="聚类/规律" style="edgeLabel;html=1;align=center;fontSize=10;fontColor=#7A6E60;labelBackgroundColor=#F7F4EF;" vertex="1" connectable="0" parent="alc2">
+          <mxGeometry x="-0.1" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+        </mxCell>
+        <mxCell id="alc3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8A5A3A;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="lc2" target="lc4">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="340" y="1540" />
+              <mxPoint x="780" y="1540" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="alc4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8A5A3A;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="lc4" target="lc5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="alc5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#8A5A3A;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="lc5" target="lc6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Legend -->
+        <mxCell id="leg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#C8B8A4;strokeWidth=1;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1560" width="1520" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="legt" value="图例 / 配色" style="text;html=1;strokeColor=none;fillColor=none;align=left;fontStyle=1;fontSize=12;fontColor=#7A6E60;" vertex="1" parent="1">
+          <mxGeometry x="55" y="1568" width="120" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="lg1" value="宿主 / API" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5B8FA8;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg2" value="引擎核心" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D4A574;fontColor=#2A1C12;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="220" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg3" value="STM / 写入" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8EA37A;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="360" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg4" value="召回 / HNSW" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0A070;fontColor=#2A1C12;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg5" value="Dream / 分类" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#7D93B3;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="640" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg6" value="遗忘 / tick" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C9897A;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="780" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg7" value="SQLite 存储" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5B7C99;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="920" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg8" value="Trait 插件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#6B9B7A;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg9" value="交换包" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#A67C52;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg10" value="物理删除" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#6E5238;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="1595" width="120" height="36" as="geometry" />
+        </mxCell>
+
+        <mxCell id="foot" value="Memora Architecture · 本地优先 · 不强制 LLM · SQLite 事实源 · 可嵌入 Rust" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontSize=11;fontColor=#9A8E80;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1665" width="1520" height="24" as="geometry" />
+        </mxCell>
+
+        <!-- Host to Engine connectors -->
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#5B8FA8;strokeWidth=2;endArrow=block;endFill=1;dashed=0;" edge="1" parent="1" source="host1" target="eng">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#5B8FA8;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="host2" target="eng">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

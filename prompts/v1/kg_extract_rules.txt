@@ -1,0 +1,16 @@
+【语义】
+嵌入断言判定：一次调用 = n 条独立人物事实边，不摘要、不按关键词筛选。求助中已知事实仍抽取；建议、未知问句、虚构/未采信转述非事实。保留不确定性、否定、条件、频次、时间、状态；不把“不吃”推断为过敏。
+主体取被描述者，点名优先，姓名取正文。名册唯一匹配才填 member_id，否则只留 name；第一人称用有效 speaker_member_id。「公共」成员 ID 只归属，非人物/家庭实体；共同事实可用 family/家庭。单字姓名可指称；不建语法碎片、未消歧代词/临时 ID 占位实体。公共标记/e2不充名称，原文明指公共交通/E2设备则保留，不按词面排除。
+【关系/家庭】
+relation 必须具体中文有向谓词，不限白名单，不用英文或「属性/有属性/关系/关联」兜底。如林子航→小名→航航，出生日期/工作单位/喜欢各表其义。
+家庭边 domains=["household"]，方向：宾语是主语的什么人。仅据当前 source_text 跨句/表格上下文推理，同次输出有据双向边，不靠名册角色或其他来源。例如明确林志远和宋娜娜是夫妻、林志远是男孩林子航的爸爸：林子航→爸爸→林志远、林志远→儿子→林子航、林志远→老婆→宋娜娜、宋娜娜→老公→林志远。妈妈及反向须母子依据，不仅由父亲配偶推出；性别不明用子女。不凭姓名猜性别/亲属，不因共同孩子认定夫妻。历史/否定/条件不变当前肯定；文档不冒充本人，不凭空推诊断/资产。歧义 pending，不猜测；可靠上下文无需逐字明述。
+【JSON/证据】
+{"entities":[...],"triples":[...],"pending":[...],"complete":true}
+实体 {"temp_id":"e1","name":"名称","type":"person","member_id":"ID?","aliases":[]}：类型不限，未知 concept；账户/债务可填所有者 ID。
+边 {"subject":"e1","relation":"小名","object":"e2","evidence_text":"原文"}：两端仅引用本批 entities 已定义的唯一 temp_id，非成员 ID/名称；不补未定义 e2实体。昵称值可为 concept，非另一人物。
+evidence_text 为 source_text 最短完整连续原文，不拼接/改写。推理边必须在 attrs 内加 assertion_basis="context_inference"、inference_note="简短可核验依据，非思维链"、evidence_spans=["连续原文",...]；spans 非空，每段连续出自 source_text并覆盖前提，evidence_text 取其中一段。不伪造引文；直接断言不必加这些字段。
+可选 object_type 同尾实体；polarity=affirmative|negative，status=active|planned|paused|ended，condition_text、confidence、attrs。attrs 留单位/剂量/频次/时间/例外/原因/限制，暂停非结束。domains 字符串数组；privacy=family_shared|owner_private，医疗/账户/成绩等敏感属性须 owner_private，推理不放宽来源隐私。
+同指别名写 aliases，用「小名/别名/称呼/姓名」边及 attrs.alias_kind=nickname|alias|address|name 留来源；仅肯定/当前有效/无条件时更新别名。pending={"reason":"原因","text":"片段"}用于主体/证据/断言不明。
+【时间/完成】
+相对日期仅用 message_at_ms/message_at_china，文档用自身锚点；无锚点留 original_time，不猜 date。消息2026-10-25：“小航下个月6号生日，送什么好？”→小航→有生日→生日(event)，证据取前半句，attrs.date="2026-11-06"、original_time="下个月6号"；不猜出生年/年龄/历法。
+complete 必填，全部覆盖才 true；预算不足 false 且闭合 JSON，不伪空成功。先实体后边，不重复 facts/解释，省空/默认字段，不省条件、否定、隐私。
