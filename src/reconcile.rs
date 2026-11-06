@@ -1016,6 +1016,7 @@ async fn apply_staged(
         let llm_event_at = event.as_ref().map(|(date, _)| date.clone());
         let event_at_ms = event.map(|(_, ms)| ms);
         let content = with_owner_name(content, &owner_id, &members);
+        let content = preserve_birth_precision(&content, &evidence);
         let fact = Fact {
             owner_id,
             content,
@@ -2425,5 +2426,48 @@ mod staging_pure_regressions {
         assert_eq!(meta["source"]["root_source_id"], "root-a");
         assert_eq!(meta["source"]["chunk_context"], fact.context_provenance);
         assert_eq!(meta["speaker_member_id"], "explicit-speaker");
+    }
+}
+
+
+// Keep an explicit birth year when the model paraphrases a full birth date as a birthday.
+// Only the single matching date in this fact's grounded evidence can supply that year.
+fn preserve_birth_precision(content: &str, evidence: &str) -> String {
+    use std::sync::OnceLock;
+    use regex::Regex;
+    static FULL: OnceLock<Regex> = OnceLock::new();
+    static MONTH_DAY: OnceLock<Regex> = OnceLock::new();
+    static YEAR: OnceLock<Regex> = OnceLock::new();
+    if !(content.contains("生日") || content.contains("出生")) ||
+        !(evidence.contains("出生") || evidence.contains("生于") || evidence.contains("生日")) {
+        return content.to_string();
+    }
+    let year = YEAR.get_or_init(|| Regex::new(r"(?:18|19|20)\d{2}").unwrap());
+    if year.is_match(content) { return content.to_string(); }
+    let full = FULL.get_or_init(|| Regex::new(r"(?P<y>(?:18|19|20)\d{2})[年/-]\s*(?P<m>\d{1,2})[月/-]\s*(?P<d>\d{1,2})[日号]?").unwrap());
+    let dates: Vec<_> = full.captures_iter(evidence).collect();
+    if dates.len() != 1 { return content.to_string(); }
+    let date=&dates[0];
+    let (y,m,d)=(date["y"].parse::<i32>().unwrap(),date["m"].parse::<u32>().unwrap(),date["d"].parse::<u32>().unwrap());
+    if chrono::NaiveDate::from_ymd_opt(y,m,d).is_none() { return content.to_string(); }
+    let md=MONTH_DAY.get_or_init(|| Regex::new(r"(?P<m>\d{1,2})月\s*(?P<d>\d{1,2})[日号]").unwrap());
+    let Some(short)=md.captures(content) else { return content.to_string(); };
+    if short["m"].parse::<u32>().ok()!=Some(m) || short["d"].parse::<u32>().ok()!=Some(d) { return content.to_string(); }
+    let span=short.get(0).unwrap();
+    format!("{}{}年{}月{}日{}",&content[..span.start()],y,m,d,&content[span.end()..])
+}
+
+#[cfg(test)]
+mod birth_precision_tests {
+    use super::preserve_birth_precision;
+    #[test]
+    fn birth_precision_keeps_explicit_year_without_inventing_one() {
+        assert_eq!(preserve_birth_precision("赵明远的生日是4月17日","赵明远出生于1991年4月17日。"),"赵明远的生日是1991年4月17日");
+        assert_eq!(preserve_birth_precision("生日是04月17号","出生日期：1991-04-17"),"生日是1991年4月17日");
+        for evidence in ["下个月17日生日","生日4月17日","出生日期：1991年2月30日","甲出生1991年4月17日，乙出生1992年4月17日"] {
+            assert_eq!(preserve_birth_precision("生日是4月17日",evidence),"生日是4月17日");
+        }
+        assert_eq!(preserve_birth_precision("生日是4月18日","出生于1991年4月17日"),"生日是4月18日");
+        assert_eq!(preserve_birth_precision("复诊日是4月17日","出生于1991年4月17日"),"复诊日是4月17日");
     }
 }
