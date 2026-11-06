@@ -280,6 +280,8 @@ struct UpsertTagBody {
 #[derive(Debug, Deserialize)]
 struct ListBody {
     #[serde(default)]
+    facts_only: bool,
+    #[serde(default)]
     keyword: Option<String>,
     #[serde(default)]
     member_id: Option<String>,
@@ -1174,6 +1176,7 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_list(
     };
     let body: ListBody = if raw.trim().is_empty() {
         ListBody {
+            facts_only: false,
             keyword: None,
             member_id: None,
             tag: None,
@@ -1201,6 +1204,7 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_list(
     let page = body.page.unwrap_or(0);
     let offset = page.saturating_mul(page_size);
     let query = ListQuery {
+        facts_only: body.facts_only,
         namespace: body.namespace,
         state: Some(MemoryState::Active),
         kind: None,

@@ -223,6 +223,9 @@ pub struct RecallQuery {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListQuery {
+    /// Browse atomic facts, including archived atoms retained behind summaries.
+    #[serde(default)]
+    pub facts_only: bool,
     pub namespace: Option<String>,
     pub state: Option<MemoryState>,
     pub kind: Option<MemoryKind>,

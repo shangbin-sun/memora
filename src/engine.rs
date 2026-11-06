@@ -1730,6 +1730,7 @@ impl MemoryEngine {
     }
 
     pub async fn list(&self, query: ListQuery) -> Result<MemoryPage> {
+        let facts_only = query.facts_only;
         let ns = query
             .namespace
             .unwrap_or_else(|| self.inner.namespace.clone());
@@ -1753,6 +1754,7 @@ impl MemoryEngine {
                 tag.as_deref(),
                 limit,
                 offset,
+                facts_only,
             )?;
             Ok(MemoryPage { items, total })
         })
@@ -2405,9 +2407,11 @@ impl MemoryEngine {
                         conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     let mut rec = get_memory(&tx, id)?
                         .ok_or_else(|| MemoraError::NotFound(id.to_string()))?;
-                    if rec.state != MemoryState::Active {
+                    let retained_atom = rec.state == MemoryState::Archived
+                        && rec.metadata.get("recall_archived").and_then(|v| v.as_bool()) == Some(true);
+                    if rec.state != MemoryState::Active && !retained_atom {
                         return Err(MemoraError::InvalidState(
-                            "revise requires active memory".into(),
+                            "revise requires active or retained atomic memory".into(),
                         ));
                     }
                     let mut affected = invalidate_derivatives(&tx, id, jieba.as_ref())?;
@@ -2416,6 +2420,10 @@ impl MemoryEngine {
                         return Err(MemoraError::InvalidState("stale revise request".into()));
                     }
                     let before = rec.clone();
+                    if retained_atom {
+                        rec.state = MemoryState::Active;
+                        if let Some(meta) = rec.metadata.as_object_mut() { meta.remove("recall_archived"); }
+                    }
                     if let Some(c) = update.content.clone() {
                         if let crate::write_filter::WriteCheck::Reject { reason } =
                             crate::write_filter::check_write(&c, Some("user"))
@@ -3592,3 +3600,28 @@ fn recall_matches(rec: &MemoryRecord, query: &RecallQuery, namespace: &str) -> b
 #[cfg(test)]
 #[path = "candidate_recall_tests.rs"]
 mod candidate_recall_tests;
+
+#[cfg(test)]
+mod retained_fact_edit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fact_browse_archived_atom_can_be_edited_without_reviving_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = MemoryEngine::builder().db_path(dir.path().join("test.db")).build().await.unwrap();
+        let mut input = RememberInput::episodic("张三每周六游泳");
+        input.skip_consolidation = true;
+        input.metadata = serde_json::json!({"skip_graph":true});
+        let id = engine.remember(input).await.unwrap();
+        {
+            let conn = engine.inner.pool.get().unwrap();
+            conn.execute("UPDATE memories SET state='archived',metadata_json=json_set(metadata_json,'$.recall_archived',json('true')) WHERE id=?1", [id.to_string()]).unwrap();
+        }
+        engine.revise(id, MemoryUpdate { content:Some("张三每周日游泳".into()),..Default::default() }).await.unwrap();
+        let edited=engine.get(id).await.unwrap().unwrap();
+        assert_eq!(edited.state,MemoryState::Active);
+        assert_eq!(edited.content,"张三每周日游泳");
+        engine.forget(id, ForgetReason::User { reason: "test".into() }).await.unwrap();
+        assert!(engine.revise(id, MemoryUpdate {content:Some("不应复活".into()),..Default::default()}).await.is_err());
+    }
+}

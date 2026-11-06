@@ -1278,6 +1278,7 @@ pub fn list_memories_page(
     tag: Option<&str>,
     limit: i64,
     offset: i64,
+    facts_only: bool,
 ) -> Result<(Vec<MemoryRecord>, i64)> {
     let limit = limit.clamp(1, 200);
     let offset = offset.max(0);
@@ -1289,7 +1290,11 @@ pub fn list_memories_page(
     let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(namespace.to_string())];
     let mut idx = 2u32;
 
-    if let Some(state) = state {
+    if facts_only {
+        // Summary-derived atoms remain valid facts; ordinary archived/deleted facts do not.
+        // A dream summary can be kind=semantic, so kind alone cannot identify it.
+        where_sql.push_str(" AND (state = 'active' OR (state = 'archived' AND json_extract(metadata_json, '$.recall_archived') = 1)) AND kind NOT IN ('summary', 'pattern') AND NOT (COALESCE(json_extract(metadata_json, '$.dream'), 0) = 1 AND COALESCE(json_extract(metadata_json, '$.support_count'), 0) > 0)");
+    } else if let Some(state) = state {
         where_sql.push_str(&format!(" AND state = ?{idx}"));
         binds.push(Box::new(state.as_str().to_string()));
         idx += 1;
@@ -1327,7 +1332,7 @@ pub fn list_memories_page(
     let total: i64 = conn.query_row(&count_sql, bind_refs.as_slice(), |r| r.get(0))?;
 
     let list_sql = format!(
-        "SELECT * FROM memories WHERE {where_sql} ORDER BY updated_at_ms DESC LIMIT ?{idx} OFFSET ?{}",
+        "SELECT * FROM memories WHERE {where_sql} ORDER BY updated_at_ms DESC, id DESC LIMIT ?{idx} OFFSET ?{}",
         idx + 1
     );
     binds.push(Box::new(limit));
@@ -1335,7 +1340,7 @@ pub fn list_memories_page(
     let bind_refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&list_sql)?;
     let rows = stmt.query_map(bind_refs.as_slice(), row_to_memory)?;
-    Ok((rows.filter_map(|r| r.ok()).collect(), total))
+    Ok((rows.collect::<std::result::Result<Vec<_>, _>>()?, total))
 }
 
 pub fn list_memories_for_export(
@@ -1599,6 +1604,37 @@ pub fn list_embeddings_for_namespace(
 #[cfg(test)]
 mod safety_tests {
     use super::*;
+
+    #[test]
+    fn fact_browse_keeps_archived_atoms_and_paginates_without_summaries() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let insert = |kind: &str, state: &str, content: &str, meta: &str| {
+            conn.execute("INSERT INTO memories(id,kind,state,content,importance,confidence,salience,created_at_ms,updated_at_ms,namespace,metadata_json,tag,subject_ids) VALUES(?1,?2,?3,?4,0.5,0.8,0.4,1,1,'default',?5,'金融','[\"张三\"]')",
+                params![Uuid::now_v7().to_string(),kind,state,content,meta]).unwrap();
+        };
+        for i in 0..1005 { insert("episodic", "active", &format!("事实{i}"), "{}"); }
+        insert("episodic", "archived", "摘要来源事实", r#"{"recall_archived":true}"#);
+        insert("semantic", "active", "合并摘要", r#"{"dream":true,"support_count":3}"#);
+        insert("summary", "active", "摘要", "{}");
+        insert("pattern", "active", "模式", "{}");
+        insert("episodic", "archived", "普通归档", "{}");
+        insert("episodic", "forgotten", "已删除事实", r#"{"recall_archived":true}"#);
+        insert("episodic", "superseded", "已替换事实", "{}");
+        let mut ids=std::collections::HashSet::new();
+        for page in 0..11 {
+            let (rows,total)=list_memories_page(&conn,"default",Some(MemoryState::Active),None,None,None,None,100,page*100,true).unwrap();
+            assert_eq!(total,1006);
+            for row in rows { assert!(ids.insert(row.id)); }
+        }
+        assert_eq!(ids.len(),1006);
+        let (rows,total)=list_memories_page(&conn,"default",Some(MemoryState::Active),None,Some("摘要来源"),Some("张三"),Some("金融"),100,0,true).unwrap();
+        assert_eq!(total,1); assert_eq!(rows[0].content,"摘要来源事实");
+        // Existing callers retain their active-only behavior.
+        let (_,total)=list_memories_page(&conn,"default",Some(MemoryState::Active),None,None,None,None,100,0,false).unwrap();
+        assert_eq!(total,1008);
+    }
+
 
     #[test]
     fn migration_v10_rekeys_fts_and_preserves_existing_memory() {
