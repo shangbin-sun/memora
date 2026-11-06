@@ -27,7 +27,7 @@ use crate::qianfan::{
     QianfanChat, QianfanClassifier, QianfanConfig, QianfanEmbedder, QianfanGraphExtractor,
     QianfanSummarizer,
 };
-use crate::reconcile::{reconcile_turn, ReconcileRequest};
+use crate::reconcile::{reconcile_turn_incremental, ReconcileRequest};
 use crate::types::{
     ForgetReason, ListQuery, MemoryService, MemoryState, MemoryUpdate, RecallQuery, RememberInput,
 };
@@ -338,6 +338,16 @@ struct RecallBody {
     #[serde(default)]
     fts_only: bool,
     timeout_ms: Option<u64>,
+    /// Also return original excerpts behind the hits (third memory type).
+    #[serde(default)]
+    include_chunks: bool,
+    #[serde(default)]
+    chunk_top_k: Option<usize>,
+    #[serde(default)]
+    chunk_max_chars: Option<usize>,
+    /// Previous user utterance, used only to resolve follow-ups like "那语文呢".
+    #[serde(default)]
+    previous_query: Option<String>,
 }
 
 fn build_engine(opts: CreateOptions) -> Result<(MemoryEngine, Option<QianfanChat>), String> {
@@ -789,8 +799,16 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_recall(
     };
 
     let timeout = Duration::from_millis(body.timeout_ms.unwrap_or(2000).clamp(100, 5000));
+    let chunk_options = body
+        .include_chunks
+        .then(|| (body.chunk_top_k.unwrap_or(2), body.chunk_max_chars.unwrap_or(2_000)));
+    let contextual = crate::contextual_query(&body.text, body.previous_query.as_deref());
+    let chunk_text = contextual.clone();
+    let chunk_namespace = body.namespace.clone();
+    let chunk_viewer = body.viewer_member_id.clone();
+    let chunk_member = body.member_id.clone();
     let query = RecallQuery {
-        text: body.text,
+        text: contextual,
         namespace: body.namespace,
         session_id: body.session_id,
         top_k: body.top_k,
@@ -817,13 +835,83 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_recall(
         }
     });
     match result {
-        Ok(result) => match serde_json::to_string(&result) {
-            Ok(s) => to_jstring(&mut env, s),
-            Err(e) => {
-                throw_runtime(&mut env, e.to_string());
-                std::ptr::null_mut()
+        Ok(result) => {
+            let encoded = match chunk_options {
+                None => serde_json::to_string(&result),
+                Some((top_k, max_chars)) => {
+                    let chunk_query = crate::chunks::ChunkRecallQuery {
+                        text: chunk_text,
+                        namespace: chunk_namespace,
+                        hit_memory_ids: result.hits.iter().map(|h| h.memory.id.to_string()).collect(),
+                        hit_evidence: result
+                            .hits
+                            .iter()
+                            .filter_map(|h| {
+                                let evidence = h.memory.metadata.get("source")?.get("evidence")?.as_str()?;
+                                Some((h.memory.id.to_string(), evidence.to_string()))
+                            })
+                            .collect(),
+                        viewer_member_id: chunk_viewer,
+                        member_id: chunk_member,
+                        top_k,
+                        max_chars,
+                    };
+                    // An excerpt failure must never cost the recalled facts.
+                    let chunks = runtime().block_on(engine.recall_chunks(chunk_query)).unwrap_or_default();
+                    serde_json::to_value(&result).and_then(|mut value| {
+                        value["chunks"] = serde_json::to_value(&chunks)?;
+                        serde_json::to_string(&value)
+                    })
+                }
+            };
+            match encoded {
+                Ok(s) => to_jstring(&mut env, s),
+                Err(e) => {
+                    throw_runtime(&mut env, e.to_string());
+                    std::ptr::null_mut()
+                }
             }
-        },
+        }
+        Err(e) => {
+            throw_runtime(&mut env, e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Backend debug lookup: `{ "id": "<memory uuid>" }` -> origin plus original excerpts.
+/// `MemoraNative.memoryTrace(long handle, String bodyJson) -> String`
+#[no_mangle]
+pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_memoryTrace(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    body_json: JString,
+) -> jstring {
+    let raw = match jstring_to_string(&mut env, body_json) {
+        Ok(s) => s,
+        Err(e) => {
+            throw_runtime(&mut env, e);
+            return std::ptr::null_mut();
+        }
+    };
+    let id = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .and_then(|id| uuid::Uuid::parse_str(id.trim()).ok());
+    let Some(id) = id else {
+        throw_runtime(&mut env, "memoryTrace needs a memory id");
+        return std::ptr::null_mut();
+    };
+    let engine = match engine_of(handle) {
+        Ok(engine) => engine,
+        Err(e) => {
+            throw_runtime(&mut env, e);
+            return std::ptr::null_mut();
+        }
+    };
+    match runtime().block_on(engine.memory_trace(id)) {
+        Ok(found) => to_jstring(&mut env, found.unwrap_or(serde_json::Value::Null).to_string()),
         Err(e) => {
             throw_runtime(&mut env, e.to_string());
             std::ptr::null_mut()
@@ -1186,7 +1274,7 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_reconcileTurn(
             return std::ptr::null_mut();
         }
     };
-    match runtime().block_on(reconcile_turn(&engine, &chat, req)) {
+    match runtime().block_on(reconcile_turn_incremental(&engine, &chat, req)) {
         Ok(report) => match serde_json::to_string(&report) {
             Ok(s) => to_jstring(&mut env, s),
             Err(e) => {

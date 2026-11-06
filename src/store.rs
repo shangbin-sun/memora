@@ -430,9 +430,46 @@ CREATE INDEX IF NOT EXISTS idx_memory_relations_to ON memory_relations(to_id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_memory ON audit_events(memory_id);
 "#;
 
+// Third memory type: original txt/md excerpts behind attachment facts.
+const SCHEMA_V11: &str = r#"
+CREATE TABLE memory_chunks (
+  id TEXT PRIMARY KEY,
+  namespace TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  content TEXT NOT NULL,
+  subject_ids TEXT NOT NULL DEFAULT '[]',
+  tags TEXT NOT NULL DEFAULT '[]',
+  source_kind TEXT NOT NULL,
+  source_name TEXT,
+  source_path TEXT,
+  source_locator TEXT,
+  session_id TEXT,
+  message_id TEXT,
+  start_char INTEGER NOT NULL,
+  end_char INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  UNIQUE(namespace, content_sha256)
+);
+CREATE VIRTUAL TABLE memory_chunk_fts USING fts5(
+  chunk_id UNINDEXED,
+  content,
+  tokenize = 'unicode61'
+);
+CREATE TABLE memory_chunk_links (
+  namespace TEXT NOT NULL,
+  memory_id TEXT NOT NULL,
+  chunk_id TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (memory_id, chunk_id)
+);
+CREATE INDEX idx_memory_chunk_links_chunk ON memory_chunk_links(chunk_id);
+"#;
+
 pub const MIGRATION_SQL: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
+    SCHEMA_V11,
 ];
 
 pub fn schema_version() -> usize { MIGRATION_SQL.len() }
@@ -595,7 +632,8 @@ pub fn upsert_fts(conn: &Connection, rec: &MemoryRecord, jieba: &Jieba) -> Resul
     }
     let content = tokenize_for_fts(jieba, &rec.content);
     let summary = tokenize_for_fts(jieba, rec.summary.as_deref().unwrap_or(""));
-    let entities = tokenize_for_fts(jieba, &rec.entities.join(" "));
+    // The owner is searchable even when the sentence itself never names them.
+    let entities = tokenize_for_fts(jieba, &format!("{} {}", rec.entities.join(" "), rec.subject_ids.join(" ")));
     conn.execute(
         "INSERT INTO memory_fts(rowid, memory_id, content, summary, entities)
          VALUES ((SELECT rowid FROM memories WHERE id = ?1),?1,?2,?3,?4)",
@@ -699,6 +737,7 @@ pub fn invalidate_derivatives(
 }
 
 pub fn delete_memory(conn: &Connection, id: MemoryId) -> Result<()> {
+    crate::chunks::unlink_memory(conn, &id.to_string())?;
     remove_fts(conn, id)?;
     conn.execute(
         "DELETE FROM embeddings WHERE memory_id = ?1",
@@ -993,6 +1032,41 @@ fn filtered_fts_rows(conn: &Connection, sql: &str, binds: &[rusqlite::types::Val
         }
     }
     Ok(hits)
+}
+
+/// Index tokens depend on jieba's word boundaries: the row says 车牌号, the question says
+/// 车牌, and FTS finds nothing. A substring scan does not care. Rows that cover most of the
+/// question come first. Local and bounded: a few milliseconds on thousands of rows.
+pub(crate) fn keyword_like_search(
+    conn: &Connection,
+    namespace: &str,
+    keywords: &[String],
+    limit: usize,
+) -> Result<Vec<MemoryId>> {
+    let spellings = crate::chunks::keyword_spellings(keywords, 24);
+    if spellings.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let clauses = vec!["content LIKE ?"; spellings.len()].join(" OR ");
+    let sql = format!(
+        "SELECT id, content, subject_ids FROM memories WHERE namespace = ? AND state = 'active' \
+         AND COALESCE(json_extract(metadata_json, '$.graph_only'), 0) = 0 AND ({clauses})"
+    );
+    let mut binds = vec![namespace.to_string()];
+    binds.extend(spellings.iter().map(|s| format!("%{}%", s.replace(['%', '_'], ""))));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    })?;
+    let mut scored: Vec<(f64, MemoryId)> = Vec::new();
+    for row in rows {
+        let (id, content, subjects) = row?;
+        let Ok(id) = Uuid::parse_str(&id) else { continue };
+        let (_, coverage) = crate::chunks::keyword_coverage(keywords, &format!("{content} {subjects}"));
+        scored.push((coverage, id));
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(scored.into_iter().take(limit).map(|(_, id)| id).collect())
 }
 
 pub fn next_embedding_label(conn: &Connection) -> Result<i64> {
@@ -1537,7 +1611,7 @@ mod safety_tests {
         conn.execute("INSERT INTO memory_fts(rowid,memory_id,content,summary,entities) VALUES(999,?1,'retained','','')",
             params![id.to_string()]).unwrap();
         migrate(&mut conn).unwrap();
-        assert_eq!(conn.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),10);
+        assert_eq!(conn.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),schema_version() as i64);
         assert_eq!(get_memory(&conn,id).unwrap().unwrap().content,"retained");
         let aligned: i64 = conn.query_row("SELECT COUNT(*) FROM memory_fts f JOIN memories m ON f.memory_id=m.id AND f.rowid=m.rowid",[],|r|r.get(0)).unwrap();
         assert_eq!(aligned,1);
@@ -1571,7 +1645,7 @@ mod safety_tests {
     fn future_pool_open_does_not_even_reconfigure_its_header() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("future.db");
         let conn=Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES('preserve'); PRAGMA user_version=11;").unwrap();
+        conn.execute_batch("CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES('preserve'); PRAGMA user_version=99;").unwrap();
         drop(conn);
         let before=std::fs::read(&path).unwrap();
         assert!(open_pool(&path).is_err());
@@ -1582,9 +1656,9 @@ mod safety_tests {
     fn future_database_is_rejected_without_lowering_its_version() {
         let mut conn=Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
-        conn.pragma_update(None,"user_version",11).unwrap();
+        conn.pragma_update(None,"user_version",99).unwrap();
         assert!(migrate(&mut conn).is_err());
-        assert_eq!(conn.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),11);
+        assert_eq!(conn.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),99);
     }
 
     #[test]

@@ -30,6 +30,20 @@ struct Fact {
     source_kind: String,
     speaker_member_id: Option<String>,
     message_at_ms: i64,
+    origin: FactOrigin,
+}
+
+/// Where a fact came from, kept apart so a fact can always be traced back.
+#[derive(Clone, Debug, Default)]
+struct FactOrigin {
+    source_name: String,
+    source_locator: Option<String>,
+    file_path: Option<String>,
+    session_id: Option<String>,
+    message_id: Option<String>,
+    /// Full user text for conversation facts; survives deleting the chat session.
+    utterance: Option<String>,
+    preserve_original: bool,
 }
 
 fn fact_key(fact: &Fact) -> String {
@@ -76,6 +90,12 @@ pub struct EvidenceSource {
     /// Skip duplicate graph projection for NEW memories extracted from this source.
     #[serde(default)]
     pub graph_already_ingested: bool,
+    /// Host opt-in: keep original excerpts behind this source's facts (txt/md only).
+    #[serde(default)]
+    pub preserve_original: bool,
+    /// Real on-device path of the uploaded file, for provenance.
+    #[serde(default)]
+    pub file_path: Option<String>,
 }
 
 fn default_evidence_kind() -> String {
@@ -98,6 +118,9 @@ pub struct ReconcileRequest {
     pub namespace: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Chat message this turn belongs to, for provenance.
+    #[serde(default)]
+    pub message_id: Option<String>,
     /// Epoch ms for relative-date anchoring; default = now.
     #[serde(default)]
     pub message_at_ms: Option<i64>,
@@ -173,6 +196,10 @@ pub struct ReconcileReport {
     pub fallback_used: bool,
     pub warnings: Vec<String>,
     pub facts: Vec<Value>,
+    /// One row per fact that reached storage: memory id, operation and full origin.
+    pub provenance: Vec<Value>,
+    /// Ids of original excerpts written or refreshed by this turn.
+    pub chunk_ids: Vec<String>,
     /// Source coverage is explicit; partial extraction must not look complete.
     pub extraction: ExtractionProgress,
 }
@@ -295,6 +322,26 @@ fn memory_text_similar(a: &str, b: &str) -> bool {
     normalize_memory_text(a) == normalize_memory_text(b)
 }
 
+/// A stored fact must read on its own: "不喝咖啡" alone says nothing about who, and
+/// neither search nor the answering model can recover it from the row's owner column.
+fn with_owner_name(content: &str, owner_id: &str, members: &[HouseholdMember]) -> String {
+    if crate::household::is_shared_member_id(owner_id) {
+        return content.to_string();
+    }
+    let member = members.iter().find(|m| m.member_id == owner_id);
+    let display = member.map_or(owner_id, |m| m.display_name.as_str());
+    let named = content.contains(display)
+        || content.contains(owner_id)
+        || member.is_some_and(|m| m.aliases.iter().any(|a| {
+            a.chars().count() >= 2 && content.contains(a.as_str())
+        }));
+    if named {
+        content.to_string()
+    } else {
+        format!("{display}{content}")
+    }
+}
+
 fn roster_prompt(members: &[HouseholdMember]) -> String {
     // Host may keep shared placeholder rows for storage; never offer them as
     // extractable people in the LLM roster.
@@ -313,7 +360,11 @@ fn roster_prompt(members: &[HouseholdMember]) -> String {
                     "member_id": m.member_id,
                     "display_name": m.display_name,
                     "role": m.role.as_str(),
-                    "aliases": m.aliases,
+                    // "我" is decided by speaker_id. Offering it as an alias makes the
+                    // model attribute any unknown first person to this row.
+                    "aliases": m.aliases.iter()
+                        .filter(|a| !crate::household::is_unresolved_owner_id(a))
+                        .collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>(),
@@ -341,6 +392,8 @@ fn tags_prompt(tags: &[crate::household::MemoryTag]) -> String {
 }
 
 const RECONCILE_MAX_SOURCE_CHARS: usize = 120_000;
+/// Longer text alongside an attachment is treated as real content, not a caption.
+const ATTACHMENT_REMARK_CHARS: usize = 40;
 const RECONCILE_EXTRACT_CONCURRENCY: usize = 2;
 // Newline-aware cuts may use only half a chunk; retain the 120k input capacity.
 const RECONCILE_MAX_CHUNKS: usize = 128;
@@ -401,6 +454,8 @@ fn evidence_tasks(req: &ReconcileRequest) -> crate::Result<Vec<EvidenceSource>> 
             locator: None,
             truncated: false,
             graph_already_ingested: false,
+            preserve_original: false,
+            file_path: None,
         }]
     } else {
         sources
@@ -448,6 +503,43 @@ pub async fn reconcile_turn(
     }
 }
 
+/// Best-effort entry for hosts that cannot resume (Android JNI). A failed block or
+/// file must not throw away everything else: complete blocks are applied, and any
+/// incomplete source loses its control records so it can never change members or
+/// delete memories on partial context. The report stays `partial`, with the ranges.
+pub async fn reconcile_turn_incremental(
+    engine: &MemoryEngine,
+    chat: &QianfanChat,
+    req: ReconcileRequest,
+) -> crate::Result<ReconcileReport> {
+    let checkpoint = match prepare_reconcile(engine, chat, req).await? {
+        ReconcileOutcome::Complete(report) => return Ok(report),
+        ReconcileOutcome::Pending { checkpoint, .. } => checkpoint,
+    };
+    let mut progress = staged_progress(&checkpoint);
+    let ReconcileCheckpoint { request, context, sources, staged } = checkpoint;
+    let mut kept_sources = Vec::new();
+    let mut kept_staged = Vec::new();
+    for (source, mut part) in sources.into_iter().zip(staged) {
+        if !crate::long_extract::valid_staged_source(&source, &part) {
+            continue;
+        }
+        for block in &mut part.parts {
+            if source.truncated || !block.parsed.complete {
+                block.parsed.registers.clear();
+                block.parsed.retractions.clear();
+            }
+        }
+        kept_sources.push(source);
+        kept_staged.push(part);
+    }
+    progress.partial = true;
+    let mut report =
+        apply_staged(engine, chat, request, context, kept_sources, kept_staged, progress).await?;
+    report.warnings.push("partial extraction applied; re-upload to fill remaining ranges".into());
+    Ok(report)
+}
+
 pub async fn prepare_reconcile(
     engine: &MemoryEngine,
     chat: &QianfanChat,
@@ -458,6 +550,31 @@ pub async fn prepare_reconcile(
         return Err(crate::MemoraError::InvalidState(
             "query is required (or non-empty evidence)".into(),
         ));
+    }
+    if sources.iter().all(|s| s.kind == "user_text")
+        && sources.iter().all(|s| crate::question_turn::is_pure_question(&s.text))
+    {
+        return Ok(ReconcileOutcome::Complete(ReconcileReport {
+            staged: false,
+            skipped: true,
+            skip_reason: Some("question_only".into()),
+            speaker_id: req.speaker_id.clone().unwrap_or_default(),
+            extract_raw: None,
+            registers: 0,
+            memories_extracted: 0,
+            memories_kept: 0,
+            retractions: 0,
+            ops_raw: None,
+            written_ids: vec![],
+            revised_ids: vec![],
+            forgotten: 0,
+            fallback_used: false,
+            warnings: vec![],
+            facts: vec![],
+            provenance: vec![],
+            chunk_ids: vec![],
+            extraction: ExtractionProgress::default(),
+        }));
     }
     let members = engine.list_members(req.namespace.as_deref()).await?;
     let tags = engine.list_tags(req.namespace.as_deref()).await?;
@@ -633,7 +750,7 @@ async fn finish_prepared(
             speaker_id: checkpoint.context.speaker.clone(), extract_raw: None,
             registers: 0, memories_extracted: progress.valid_records, memories_kept: 0,
             retractions: 0, ops_raw: None, written_ids: vec![], revised_ids: vec![], forgotten: 0,
-            fallback_used: false, facts: vec![],
+            fallback_used: false, facts: vec![], provenance: vec![], chunk_ids: vec![],
             warnings: vec!["valid extraction records staged only; no memory/member/graph operations applied; resume unresolved ranges".into()],
             extraction: progress,
         };
@@ -675,12 +792,17 @@ async fn apply_staged(
     // hard windows must not inflate the report with the same wire record.
     let memories_extracted = extraction.valid_records;
     let mut warnings = Vec::new();
+    let mut part_text: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let turn_has_attachment = sources.iter().any(|source| source.kind != "user_text");
     for (root_source, staged_source) in sources.into_iter().zip(staged) {
         warnings.extend(staged_source.warnings);
         for staged_part in staged_source.parts {
             let part = staged_part.source;
             let parsed = staged_part.parsed;
             extract_raw_last = staged_part.raw.or(extract_raw_last);
+            if part.preserve_original {
+                part_text.insert(part.id.clone(), part.text.clone());
+            }
             let collect = |key: &str,
                            items: &[Value],
                            out: &mut Vec<Value>,
@@ -691,8 +813,32 @@ async fn apply_staged(
                         warnings.push(format!("extract drop invalid provenance: {key}"));
                         continue;
                     }
-                    if matches!(key, "register" | "retractions") && part.kind != "user_text" {
+                    // Deletion always needs the user's own words. People may be introduced
+                    // by an uploaded document, which is how a cold start learns who is who.
+                    if key == "retractions" && part.kind != "user_text" {
                         continue;
+                    }
+                    if key == "register" && !matches!(part.kind.as_str(), "user_text" | "document") {
+                        continue;
+                    }
+                    // "这是孩子买的课" only introduces the file. Stored as a fact it says
+                    // nothing, and it outranks the real rows because it names the same words.
+                    if matches!(key, "memories" | "register")
+                        && turn_has_attachment
+                        && part.kind == "user_text"
+                        && part.text.chars().count() <= ATTACHMENT_REMARK_CHARS
+                    {
+                        continue;
+                    }
+                    if key == "memories" && part.kind == "user_text" {
+                        let evidence = item["evidence"].as_str().unwrap_or("");
+                        let content = item["content"].as_str().unwrap_or("");
+                        if crate::question_turn::evidence_in_question(&part.text, evidence)
+                            || crate::question_turn::describes_the_asking(content)
+                        {
+                            warnings.push("extract drop fact taken from a question".into());
+                            continue;
+                        }
                     }
                     let body = item
                         .get(if key == "register" {
@@ -711,6 +857,10 @@ async fn apply_staged(
                         accepted["_host_source_id"] = json!(part.id);
                         accepted["_host_source_kind"] = json!(part.kind);
                         accepted["_host_root_source_id"] = json!(root_source.id);
+                        accepted["_host_source_name"] = json!(part.name);
+                        accepted["_host_source_locator"] = json!(part.locator);
+                        accepted["_host_file_path"] = json!(part.file_path);
+                        accepted["_host_preserve_original"] = json!(part.preserve_original);
                         // Full model summaries and raw citation units stay only
                         // in the ephemeral checkpoint: persisting them could
                         // leak unrelated subjects under this fact's ACL.
@@ -776,15 +926,33 @@ async fn apply_staged(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let member_id = name.to_string();
+        // A new alias must land on the person already known, never replace their aliases.
+        let known = engine.list_members(ns).await?;
+        let existing = known.iter().find(|m| {
+            m.member_id == name || m.display_name == name || m.aliases.iter().any(|a| a == name)
+        });
+        let mut merged: Vec<String> = existing.map(|m| m.aliases.clone()).unwrap_or_default();
+        for alias in aliases {
+            let taken_by_other = known.iter().any(|m| {
+                existing.map_or(true, |e| e.member_id != m.member_id)
+                    && (m.member_id == alias || m.display_name == alias || m.aliases.iter().any(|a| a == &alias))
+            });
+            if !taken_by_other
+                && !crate::household::is_unresolved_owner_id(&alias)
+                && !merged.contains(&alias)
+                && alias != name
+            {
+                merged.push(alias);
+            }
+        }
         let _ = engine
             .upsert_member(
                 ns,
                 HouseholdMember {
-                    member_id,
-                    display_name: name.into(),
-                    role,
-                    aliases,
+                    member_id: existing.map_or_else(|| name.to_string(), |m| m.member_id.clone()),
+                    display_name: existing.map_or_else(|| name.to_string(), |m| m.display_name.clone()),
+                    role: existing.map_or(role, |m| m.role),
+                    aliases: merged,
                     age_band: None,
                 },
             )
@@ -808,6 +976,19 @@ async fn apply_staged(
                 continue;
             }
         };
+        // The default driver row answers to "我" for UI enrollment only. Without a
+        // verified speaker, "我" is nobody: that is what keeps an unknown voice's first
+        // person out of someone else's memories.
+        if owner_id != explicit_speaker
+            && members.iter().any(|m| {
+                m.member_id == owner_id
+                    && m.aliases.iter().any(|a| crate::household::is_unresolved_owner_id(a))
+            })
+            && !item.get("evidence").and_then(Value::as_str).unwrap_or("").contains(owner_id.as_str())
+        {
+            warnings.push("extract drop first person without a verified speaker".into());
+            continue;
+        }
         // Content-derived owners may not be on the roster yet; roster is for
         // dedupe/merge only. Upsert so later facts and retractions can resolve.
         if !members.iter().any(|m| m.member_id == owner_id) {
@@ -834,9 +1015,10 @@ async fn apply_staged(
         let event = validated_event_date(item.get("event_at").and_then(Value::as_str));
         let llm_event_at = event.as_ref().map(|(date, _)| date.clone());
         let event_at_ms = event.map(|(_, ms)| ms);
+        let content = with_owner_name(content, &owner_id, &members);
         let fact = Fact {
             owner_id,
-            content: content.to_string(),
+            content,
             tag,
             llm_event_at,
             event_at_ms,
@@ -856,6 +1038,16 @@ async fn apply_staged(
             source_kind: item["_host_source_kind"].as_str().unwrap_or("").to_string(),
             speaker_member_id: (!explicit_speaker.is_empty()).then(|| explicit_speaker.to_string()),
             message_at_ms,
+            origin: FactOrigin {
+                source_name: item["_host_source_name"].as_str().unwrap_or("").to_string(),
+                source_locator: item["_host_source_locator"].as_str().map(str::to_string),
+                file_path: item["_host_file_path"].as_str().map(str::to_string),
+                session_id: req.session_id.clone(),
+                message_id: req.message_id.clone(),
+                utterance: (item["_host_source_kind"].as_str() == Some("user_text"))
+                    .then(|| req.query.chars().take(2_000).collect()),
+                preserve_original: item["_host_preserve_original"].as_bool().unwrap_or(false),
+            },
         };
         if fact_seen.insert(fact_key(&fact)) {
             facts.push(fact);
@@ -872,24 +1064,25 @@ async fn apply_staged(
         if topic.is_empty() {
             continue;
         }
-        let hits = engine
-            .recall(RecallQuery {
-                text: topic.chars().take(240).collect(),
-                namespace: req.namespace.clone(),
-                top_k: Some(6),
-                fts_only: true,
-                skip_graph: true,
-                ..Default::default()
-            })
-            .await?;
         let Some(owner) = validated_owner(item, &members) else {
             warnings.push("ignored retraction without a unique roster owner".into());
             continue;
         };
+        let hits = engine
+            .recall(RecallQuery {
+                text: topic.chars().take(240).collect(),
+                namespace: req.namespace.clone(),
+                top_k: Some(12),
+                fts_only: true,
+                skip_graph: true,
+                member_id: Some(owner.clone()),
+                ..Default::default()
+            })
+            .await?;
         let candidates: Vec<_> = hits
             .hits
             .into_iter()
-            .filter(|h| normalize_memory_text(&h.memory.content) == normalize_memory_text(topic))
+            .filter(|h| retraction_matches(&h.memory.content, topic))
             .collect();
         let targets: Vec<_> = candidates
             .iter()
@@ -943,6 +1136,8 @@ async fn apply_staged(
             fallback_used,
             warnings,
             facts: vec![],
+            provenance: vec![],
+            chunk_ids: vec![],
             extraction: extraction.clone(),
         });
     }
@@ -981,16 +1176,21 @@ async fn apply_staged(
     // Only facts with actual old candidates need model-assisted comparison.
     // Batch small, lossless JSON objects: never truncate fact text in ops prompts.
     let mut ops_prompts = Vec::new();
-    for batch in facts.chunks(RECONCILE_OPS_MAX_FACTS) {
+    let conversational: Vec<(usize, &Fact)> = facts
+        .iter()
+        .enumerate()
+        .filter(|(_, fact)| fact.source_kind == "user_text")
+        .collect();
+    for batch in conversational.chunks(RECONCILE_OPS_MAX_FACTS) {
         let candidates: Vec<_> = hits
             .iter()
-            .filter(|hit| batch.iter().any(|fact| same_fact_bucket(hit, fact)))
+            .filter(|hit| batch.iter().any(|(_, fact)| same_correction_bucket(hit, fact)))
             .take(RECONCILE_OPS_MAX_HITS)
             .collect();
         if candidates.is_empty() {
             continue;
         }
-        let facts_json: Value = batch.iter().map(|f| json!({"owner": f.owner_id, "content": f.content, "tag": f.tag, "event_at": f.llm_event_at, "subjects": [f.owner_id.clone()]})).collect();
+        let facts_json: Value = batch.iter().map(|(index, f)| json!({"fact_index": index, "owner": f.owner_id, "content": f.content, "tag": f.tag, "event_at": f.llm_event_at, "subjects": [f.owner_id.clone()]})).collect();
         let hits_json: Value = candidates.iter().map(|h| json!({"id": h.id, "content": h.content, "tag": h.tag, "subjects": h.subject_ids})).collect();
         let prompt = format!(
             "{}\n新事实：{}\n旧记忆（按成员和标签过滤的候选）：{}\n",
@@ -1050,6 +1250,9 @@ async fn apply_staged(
     performance.mark("ops_parse");
     // Reconciliation decisions below may only reference validated facts.
     let mut written_keys = HashSet::new();
+    // Every fact that reached storage, so provenance and excerpts can reference it.
+    let mut stored: std::collections::HashMap<String, (String, &'static str)> =
+        std::collections::HashMap::new();
     if let Some(ops_root) = parse_json_object(&ops_text) {
         if let Some(Value::Array(ops)) = ops_root.get("ops") {
             for item in ops {
@@ -1074,17 +1277,19 @@ async fn apply_staged(
                     continue;
                 }
                 let id = item.get("id").and_then(Value::as_str).unwrap_or("").trim();
-                let target = hit_by_id.get(id).filter(|h| same_fact_bucket(h, fact));
+                let target = hit_by_id.get(id).filter(|h| same_correction_bucket(h, fact));
                 match op.as_str() {
                     "noop" | "keep" | "skip" => {
                         // The LLM decides semantic equivalence for an authorized
                         // candidate; host checks identity/bucket, not wording.
-                        if target.is_some()
-                            || hits.iter().any(|h| {
+                        let same = target.or_else(|| {
+                            hits.iter().find(|h| {
                                 same_fact_bucket(h, fact)
                                     && memory_text_similar(&h.content, &fact.content)
                             })
-                        {
+                        });
+                        if let Some(same) = same {
+                            stored.insert(key.clone(), (same.id.to_string(), "noop"));
                             written_keys.insert(key);
                         }
                     }
@@ -1096,6 +1301,7 @@ async fn apply_staged(
                             {
                                 Ok(()) => {
                                     revised_ids.push(existing.id.to_string());
+                                    stored.insert(key.clone(), (existing.id.to_string(), "revise"));
                                     written_keys.insert(key);
                                 }
                                 Err(e) => warnings.push(format!("ops revise failed: {e}")),
@@ -1104,10 +1310,11 @@ async fn apply_staged(
                         // Cross-owner/cross-tag/missing targets fall back to add.
                     }
                     "add" | "remember" => {
-                        if hits.iter().any(|h| {
+                        if let Some(same) = hits.iter().find(|h| {
                             same_fact_bucket(h, fact)
                                 && memory_text_similar(&h.content, &fact.content)
                         }) {
+                            stored.insert(key.clone(), (same.id.to_string(), "noop"));
                             written_keys.insert(key);
                             continue;
                         }
@@ -1115,6 +1322,7 @@ async fn apply_staged(
                             .await
                         {
                             Ok(id) => {
+                                stored.insert(key.clone(), (id.clone(), "add"));
                                 written_ids.push(id);
                                 written_keys.insert(key);
                             }
@@ -1133,6 +1341,20 @@ async fn apply_staged(
         if written_keys.contains(&key) {
             continue;
         }
+        if fact.source_kind != "user_text" {
+            let repeated = hits.iter().find(|h| {
+                same_correction_bucket(h, fact)
+                    && h.metadata.get("source").and_then(|s| s.get("kind")).and_then(Value::as_str)
+                        == Some(fact.source_kind.as_str())
+                    && h.metadata.get("source").and_then(|s| s.get("evidence")).and_then(Value::as_str)
+                        == Some(fact.evidence.as_str())
+            });
+            if let Some(hit) = repeated {
+                stored.insert(key.clone(), (hit.id.to_string(), "noop"));
+                written_keys.insert(key);
+                continue;
+            }
+        }
         let same = hits
             .iter()
             .find(|h| same_fact_bucket(h, fact) && memory_text_similar(&h.content, &fact.content));
@@ -1143,6 +1365,7 @@ async fn apply_staged(
             {
                 Ok(()) => {
                     revised_ids.push(hit.id.to_string());
+                    stored.insert(key.clone(), (hit.id.to_string(), "revise"));
                     written_keys.insert(key);
                 }
                 Err(e) => warnings.push(format!("fallback revise failed: {e}")),
@@ -1150,6 +1373,7 @@ async fn apply_staged(
         } else {
             match remember_validated_fact(engine, fact, ns, req.session_id.as_deref()).await {
                 Ok(id) => {
+                    stored.insert(key.clone(), (id.clone(), "add"));
                     written_ids.push(id);
                     written_keys.insert(key);
                 }
@@ -1158,6 +1382,24 @@ async fn apply_staged(
         }
     }
     performance.mark("write");
+    let (chunk_writes, chunk_of_fact) = chunk_writes_for(&facts, &stored, &part_text, ns);
+    let chunk_ids = match engine.save_chunks(chunk_writes).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            warnings.push(format!("original excerpts not saved: {error}"));
+            Vec::new()
+        }
+    };
+    let provenance: Vec<Value> = facts
+        .iter()
+        .filter_map(|fact| {
+            let key = fact_key(fact);
+            let (memory_id, op) = stored.get(&key)?;
+            let chunk_id = chunk_of_fact.get(&key).and_then(|i| chunk_ids.get(*i));
+            Some(fact_provenance(fact, memory_id, op, chunk_id))
+        })
+        .collect();
+    performance.mark("chunks");
     let facts_out: Vec<Value> = facts
         .iter()
         .map(|f| {
@@ -1190,6 +1432,8 @@ async fn apply_staged(
         fallback_used,
         warnings,
         facts: facts_out,
+        provenance,
+        chunk_ids,
         extraction,
     })
 }
@@ -1241,6 +1485,9 @@ fn matched_op_fact<'a>(
     facts: &'a [Fact],
     members: &[HouseholdMember],
 ) -> Option<&'a Fact> {
+    if let Some(index) = item.get("fact_index").and_then(Value::as_u64) {
+        return facts.get(usize::try_from(index).ok()?);
+    }
     let content = item.get("content").and_then(Value::as_str)?.trim();
     if content.is_empty() {
         return None;
@@ -1284,6 +1531,28 @@ fn matched_op_fact<'a>(
         return None;
     }
     Some(fact)
+}
+
+/// A correction may move a date ("周三改到周四"), so only person and tag must match.
+/// Whether it is the same event is the ops model's call; dedupe stays on same_fact_bucket.
+fn same_correction_bucket(memory: &crate::types::MemoryRecord, fact: &Fact) -> bool {
+    memory.subject_ids == [fact.owner_id.clone()] && (memory.tag.is_empty() || memory.tag == fact.tag)
+}
+
+/// The model cannot quote a stored row it never saw: "忘掉我喜欢打羽毛球" names the fact
+/// in the user's words. Match either direction within that person's rows.
+fn retraction_matches(stored: &str, topic: &str) -> bool {
+    let stored = normalize_memory_text(stored);
+    let topic = normalize_memory_text(topic);
+    stored == topic
+        || (topic.chars().count() >= 4
+            && (is_subsequence(&topic, &stored) || is_subsequence(&stored, &topic)))
+}
+
+/// 周明在学吉他 is 周明最近在学吉他 minus a word: same fact, not a substring.
+fn is_subsequence(short: &str, long: &str) -> bool {
+    let mut chars = long.chars();
+    short.chars().all(|wanted| chars.any(|c| c == wanted))
 }
 
 fn same_fact_bucket(memory: &crate::types::MemoryRecord, fact: &Fact) -> bool {
@@ -1389,7 +1658,69 @@ fn context_references(context: &Value) -> Value {
 fn fact_source(fact: &Fact) -> Value {
     json!({"kind": fact.source_kind, "source_id": fact.source_id, "root_source_id": fact.root_source_id,
         "evidence": fact.evidence, "message_at_ms": fact.message_at_ms,
-        "original_span": fact.source_span, "chunk_context": fact.context_provenance})
+        "original_span": fact.source_span, "chunk_context": fact.context_provenance,
+        "name": fact.origin.source_name, "locator": fact.origin.source_locator,
+        "file_path": fact.origin.file_path, "session_id": fact.origin.session_id,
+        "message_id": fact.origin.message_id, "utterance": fact.origin.utterance})
+}
+
+/// Group facts by the block they came from. Only facts that reached storage count,
+/// so a block with no stored fact keeps no original text.
+fn chunk_writes_for(
+    facts: &[Fact],
+    stored: &std::collections::HashMap<String, (String, &'static str)>,
+    part_text: &std::collections::HashMap<String, String>,
+    namespace: Option<&str>,
+) -> (Vec<crate::chunks::ChunkWrite>, std::collections::HashMap<String, usize>) {
+    let mut writes: Vec<crate::chunks::ChunkWrite> = Vec::new();
+    let mut by_part: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut chunk_of_fact = std::collections::HashMap::new();
+    for fact in facts {
+        if !fact.origin.preserve_original {
+            continue;
+        }
+        let key = fact_key(fact);
+        let (Some((memory_id, _)), Some(text)) = (stored.get(&key), part_text.get(&fact.source_id)) else {
+            continue;
+        };
+        // Same defense as fact writes: a secret must not persist through the excerpt.
+        if !crate::write_filter::check_write(text, None).ok() {
+            continue;
+        }
+        let index = *by_part.entry(fact.source_id.clone()).or_insert_with(|| {
+            writes.push(crate::chunks::ChunkWrite {
+                namespace: namespace.unwrap_or_default().to_string(),
+                content: text.clone(),
+                source_kind: fact.source_kind.clone(),
+                source_name: fact.origin.source_name.clone(),
+                source_path: fact.origin.file_path.clone(),
+                source_locator: fact.origin.source_locator.clone(),
+                session_id: fact.origin.session_id.clone(),
+                message_id: fact.origin.message_id.clone(),
+                start_char: fact.source_span["start"].as_i64().unwrap_or(0),
+                end_char: fact.source_span["end"].as_i64().unwrap_or(0),
+                ..Default::default()
+            });
+            writes.len() - 1
+        });
+        let write = &mut writes[index];
+        write.memory_ids.push(memory_id.clone());
+        if !write.subject_ids.contains(&fact.owner_id) {
+            write.subject_ids.push(fact.owner_id.clone());
+        }
+        if !fact.tag.is_empty() && !write.tags.contains(&fact.tag) {
+            write.tags.push(fact.tag.clone());
+        }
+        chunk_of_fact.insert(key, index);
+    }
+    (writes, chunk_of_fact)
+}
+
+fn fact_provenance(fact: &Fact, memory_id: &str, op: &str, chunk_id: Option<&String>) -> Value {
+    json!({
+        "memory_id": memory_id, "op": op, "owner": fact.owner_id, "tag": fact.tag,
+        "content": fact.content, "chunk_id": chunk_id, "source": fact_source(fact),
+    })
 }
 
 async fn remember_validated_fact(
@@ -1451,6 +1782,7 @@ async fn remember_fact(
             source_kind: "user_text".into(),
             message_at_ms,
             graph_already_ingested,
+            origin: FactOrigin::default(),
         },
         namespace,
         session_id,
@@ -1605,6 +1937,7 @@ mod document_regressions {
             source_kind: "user_text".into(),
             speaker_member_id: None,
             message_at_ms: now_ms(),
+            origin: FactOrigin::default(),
         };
         engine
             .revise(id, fact_update(&row, &correction).unwrap())
@@ -1701,6 +2034,7 @@ mod text_regressions {
             source_kind: "user_text".into(),
             speaker_member_id: None,
             message_at_ms: now_ms(),
+            origin: FactOrigin::default(),
         }
     }
 
@@ -1834,6 +2168,7 @@ mod staging_pure_regressions {
             source_kind: "document".into(),
             speaker_member_id: None,
             message_at_ms: 1_700_000_000_000,
+            origin: FactOrigin::default(),
         }
     }
 
@@ -1947,6 +2282,8 @@ mod staging_pure_regressions {
             locator: None,
             truncated: false,
             graph_already_ingested: false,
+            preserve_original: false,
+            file_path: None,
         };
         let parts = [(0, 2500), (2400, 4801)].into_iter().enumerate().map(|(index,(start,end))| {
             let mut source = root.clone();

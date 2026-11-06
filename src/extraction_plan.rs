@@ -214,20 +214,35 @@ pub fn plan_prompt(
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Response {
     chunks: Vec<ResponseChunk>,
-    carry: Vec<ContextNote>,
+    #[serde(default)]
+    carry: Vec<LooseNote>,
     complete: bool,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ResponseChunk {
     first: usize,
     last: usize,
-    context: Vec<ContextNote>,
+    #[serde(default)]
+    context: Vec<LooseNote>,
+    #[serde(default = "default_estimated_facts")]
     estimated_facts: usize,
+}
+
+fn default_estimated_facts() -> usize {
+    1
+}
+
+/// Context notes only help disambiguate, and models get their shape wrong. A wrong
+/// note is dropped alone; it must never cost the boundaries of the whole window.
+#[derive(Deserialize)]
+struct LooseNote {
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    refs: Vec<usize>,
 }
 
 fn valid_unit(unit: &TextUnit) -> bool {
@@ -261,32 +276,83 @@ fn validate_window(window: &[TextUnit], all_units: &[TextUnit]) -> Result<(), St
     Ok(())
 }
 
-fn validate_notes(
-    notes: &[ContextNote],
-    allowed: &HashMap<usize, &TextUnit>,
-    label: &str,
-) -> Result<(), String> {
-    if notes.len() > CONTEXT_NOTES {
-        return Err(format!("{label} exceeds 6 notes"));
-    }
+/// Keep only grounded notes within the budgets. Anything else simply is not context.
+fn grounded_notes(notes: Vec<LooseNote>, allowed: &HashMap<usize, &TextUnit>) -> Vec<ContextNote> {
+    let mut kept = Vec::new();
     let mut citation_chars = 0;
     for note in notes {
-        if !valid_note_shape(note) {
-            return Err(format!(
-                "{label} requires nonblank summaries <=240 characters and 1..4 unique refs"
-            ));
+        if kept.len() == CONTEXT_NOTES {
+            break;
         }
-        for id in &note.refs {
-            let unit = allowed
-                .get(id)
-                .ok_or_else(|| format!("{label} references unsent original unit {id}"))?;
-            citation_chars += unit.text.chars().count();
-            if citation_chars > CITATION_CHARS {
-                return Err(format!("{label} exceeds 1800 cited original characters"));
+        let note = ContextNote { summary: note.summary, refs: note.refs };
+        if !valid_note_shape(&note) {
+            continue;
+        }
+        let Some(cited) = note
+            .refs
+            .iter()
+            .map(|id| allowed.get(id).map(|unit| unit.text.chars().count()))
+            .sum::<Option<usize>>()
+        else {
+            continue;
+        };
+        if citation_chars + cited > CITATION_CHARS {
+            continue;
+        }
+        citation_chars += cited;
+        kept.push(note);
+    }
+    kept
+}
+
+/// Models over-split: one 560-character file came back as 11 blocks, each a slow call.
+/// Merge neighbours up to the existing target so a block means a real unit of work.
+pub(crate) fn merge_small_chunks(
+    chunks: Vec<PlannedChunk>,
+    window: &[TextUnit],
+    target_chars: usize,
+) -> Vec<PlannedChunk> {
+    let bounds = |chunk: &PlannedChunk| {
+        let first = window.iter().find(|u| u.id == chunk.first).map_or(0, |u| u.start);
+        let last = window.iter().find(|u| u.id == chunk.last).map_or(0, |u| u.end);
+        (first, last)
+    };
+    let mut merged: Vec<PlannedChunk> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if let Some(previous) = merged.last_mut() {
+            let (start, _) = bounds(previous);
+            let (_, end) = bounds(&chunk);
+            if end - start <= target_chars {
+                previous.last = chunk.last;
+                previous.estimated_facts = (previous.estimated_facts + chunk.estimated_facts).min(100);
+                for note in chunk.context {
+                    if previous.context.len() < CONTEXT_NOTES && !previous.context.contains(&note) {
+                        previous.context.push(note);
+                    }
+                }
+                continue;
+            }
+        }
+        merged.push(chunk);
+    }
+    merged
+}
+
+/// Used when the model's plan is unusable: split on the structural units instead of
+/// losing the file. Boundaries stay original, only the semantic grouping is simpler.
+pub(crate) fn structural_chunks(window: &[TextUnit], target_chars: usize) -> Vec<PlannedChunk> {
+    let mut chunks: Vec<PlannedChunk> = Vec::new();
+    let mut start = 0;
+    for unit in window {
+        match chunks.last_mut() {
+            Some(chunk) if unit.end - start <= target_chars => chunk.last = unit.id,
+            _ => {
+                start = unit.start;
+                chunks.push(PlannedChunk { first: unit.id, last: unit.id, context: Vec::new(), estimated_facts: 1 });
             }
         }
     }
-    Ok(())
+    chunks
 }
 
 /// Atomically validate a complete JSON plan; no malformed/partial prefix is salvaged.
@@ -299,7 +365,7 @@ pub fn parse_plan(
     all_units: &[TextUnit],
 ) -> Result<(Vec<PlannedChunk>, Vec<ContextNote>), String> {
     validate_window(window, all_units)?;
-    let response: Response = serde_json::from_str(raw)
+    let response: Response = serde_json::from_str(strip_code_fence(raw))
         .map_err(|error| format!("invalid extraction plan JSON: {error}"))?;
     if !response.complete {
         return Err("extraction plan must declare complete:true".into());
@@ -334,23 +400,27 @@ pub fn parse_plan(
         if size > CHUNK_CHARS {
             return Err("chunk exceeds 2500 original characters".into());
         }
-        if !(1..=100).contains(&chunk.estimated_facts) {
-            return Err("estimated_facts must be an integer in 1..100".into());
-        }
-        validate_notes(&chunk.context, &allowed, "chunk context")?;
         chunks.push(PlannedChunk {
             first: chunk.first,
             last: chunk.last,
-            context: chunk.context,
-            estimated_facts: chunk.estimated_facts,
+            context: grounded_notes(chunk.context, &allowed),
+            estimated_facts: chunk.estimated_facts.clamp(1, 100),
         });
         cursor = last_index + 1;
     }
     if cursor != window.len() {
         return Err("extraction plan leaves uncovered window units".into());
     }
-    validate_notes(&response.carry, &allowed, "carry")?;
-    Ok((chunks, response.carry))
+    Ok((chunks, grounded_notes(response.carry, &allowed)))
+}
+
+fn strip_code_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let Some(body) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let body = body.split_once('\n').map_or(body, |(_, rest)| rest);
+    body.trim_end().strip_suffix("```").unwrap_or(body).trim()
 }
 
 #[cfg(test)]
@@ -514,17 +584,41 @@ mod tests {
             "{}",
             &valid[..valid.len() - 1],
             &format!("{valid}\n{{}}"),
-            &format!("```json\n{valid}\n```"),
             "{\"chunks\":[],\"carry\":[],\"complete\":true}",
         ] {
             assert!(parse_plan(raw, &units, &[], &units).is_err());
         }
+        // Harmless wrapping and extra fields do not cost the boundaries.
+        assert!(parse_plan(&format!("```json\n{valid}\n```"), &units, &[], &units).is_ok());
         let mut plan = response(&units);
-        plan["chunks"][0]["rewrite"] = json!("not allowed");
-        assert!(!accepts(&plan, &units));
+        plan["chunks"][0]["rewrite"] = json!("ignored");
+        assert!(accepts(&plan, &units));
         plan = response(&units);
         plan["carry"] = json!([{"summary":"late invalid note","refs":[900]}]);
-        assert!(!accepts(&plan, &units));
+        let (_, carry) = parse_plan(&plan.to_string(), &units, &[], &units).unwrap();
+        assert!(carry.is_empty(), "an ungrounded note is dropped, never trusted");
+    }
+
+    #[test]
+    fn merge_reaches_the_target_without_crossing_it() {
+        let units = text_units(&"甲\n".repeat(20));
+        let per_unit: Vec<PlannedChunk> = units.iter().map(|u| PlannedChunk {
+            first: u.id, last: u.id, context: Vec::new(), estimated_facts: 1,
+        }).collect();
+        let merged = merge_small_chunks(per_unit, &units, 10);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0].first, 0);
+        assert_eq!(merged[3].last, 19);
+        assert!(merged.windows(2).all(|pair| pair[0].last + 1 == pair[1].first));
+    }
+
+    #[test]
+    fn structural_chunks_cover_every_unit_in_order() {
+        let units = text_units(&format!("{}\n", "乙".repeat(400)).repeat(5));
+        let chunks = structural_chunks(&units, 1_200);
+        assert_eq!(chunks.first().unwrap().first, 0);
+        assert_eq!(chunks.last().unwrap().last, units.last().unwrap().id);
+        assert!(chunks.windows(2).all(|pair| pair[0].last + 1 == pair[1].first));
     }
 
     #[test]
@@ -538,19 +632,12 @@ mod tests {
     #[test]
     fn estimate_range_is_strict() {
         let units = text_units("one");
-        for value in [
-            json!(0),
-            json!(101),
-            json!(-1),
-            json!(1.5),
-            json!("12"),
-            Value::Null,
-        ] {
+        for value in [json!(-1), json!(1.5), json!("12"), Value::Null] {
             let mut plan = response(&units);
             plan["chunks"][0]["estimated_facts"] = value;
             assert!(!accepts(&plan, &units));
         }
-        for value in [1, 100] {
+        for value in [0, 1, 100, 101] {
             let mut plan = response(&units);
             plan["chunks"][0]["estimated_facts"] = json!(value);
             assert!(accepts(&plan, &units));
@@ -572,21 +659,14 @@ mod tests {
         for invalid_note in invalid {
             let mut plan = response(&units);
             plan["chunks"][0]["context"] = json!([invalid_note]);
-            assert!(!accepts(&plan, &units));
+            let (chunks, _) = parse_plan(&plan.to_string(), &units, &[], &units).unwrap();
+            assert!(chunks[0].context.is_empty());
         }
         let mut plan = response(&units);
         plan["carry"] = json!([note(&"界".repeat(240), &[0, 1, 2, 3])]);
-        assert!(accepts(&plan, &units));
-        for field in ["carry", "context"] {
-            let notes = json!(vec![note("x", &[0]); 7]);
-            if field == "carry" {
-                plan["carry"] = notes;
-            } else {
-                plan["carry"] = json!([]);
-                plan["chunks"][0]["context"] = notes;
-            }
-            assert!(!accepts(&plan, &units));
-        }
+        assert_eq!(parse_plan(&plan.to_string(), &units, &[], &units).unwrap().1.len(), 1);
+        plan["carry"] = json!(vec![note("x", &[0]); 7]);
+        assert_eq!(parse_plan(&plan.to_string(), &units, &[], &units).unwrap().1.len(), 6);
     }
 
     #[test]
@@ -596,12 +676,14 @@ mod tests {
         plan["chunks"][0]["context"] = json!([note("grounded", &[0, 1, 2])]);
         assert!(accepts(&plan, &units));
         plan["chunks"][0]["context"] = json!([note("too much", &[0, 1, 2, 3])]);
-        assert!(!accepts(&plan, &units));
+        let parsed = parse_plan(&plan.to_string(), &units, &[], &units).unwrap();
+        assert!(parsed.0[0].context.is_empty());
         plan["chunks"][0]["context"] = json!(vec![note("repeat", &[0]); 4]);
-        assert!(!accepts(&plan, &units));
+        let parsed = parse_plan(&plan.to_string(), &units, &[], &units).unwrap();
+        assert_eq!(parsed.0[0].context.len(), 3, "budget counts repeated excerpts");
         plan["chunks"][0]["context"] = json!([]);
         plan["carry"] = json!([note("too much", &[0, 1, 2, 3])]);
-        assert!(!accepts(&plan, &units));
+        assert!(parse_plan(&plan.to_string(), &units, &[], &units).unwrap().1.is_empty());
     }
 
     #[test]
@@ -611,7 +693,8 @@ mod tests {
         for id in [0, 2, 99] {
             let mut plan = response(window);
             plan["chunks"][0]["context"] = json!([note("not sent", &[id])]);
-            assert!(parse_plan(&plan.to_string(), window, &[], &units).is_err());
+            let (chunks, _) = parse_plan(&plan.to_string(), window, &[], &units).unwrap();
+            assert!(chunks[0].context.is_empty(), "unsent refs gain no authority");
         }
         let carry = vec![note("past context", &[0])];
         let mut plan = response(window);
@@ -635,10 +718,8 @@ mod tests {
         for id in 0..4 {
             let mut plan = response(window);
             plan["chunks"][0]["context"] = json!([note("cite", &[id])]);
-            assert_eq!(
-                parse_plan(&plan.to_string(), window, &carry, &units).is_ok(),
-                id < 3
-            );
+            let (chunks, _) = parse_plan(&plan.to_string(), window, &carry, &units).unwrap();
+            assert_eq!(!chunks[0].context.is_empty(), id < 3);
         }
         let sent_chars: usize = prompt["prior_context"]
             .as_array()
@@ -671,7 +752,7 @@ mod tests {
         assert_eq!(prompt["prior_context"].as_array().unwrap().len(), 6);
         let mut plan = response(window);
         plan["carry"] = json!([note("seventh unseen", &[6])]);
-        assert!(parse_plan(&plan.to_string(), window, &carry, &units).is_err());
+        assert!(parse_plan(&plan.to_string(), window, &carry, &units).unwrap().1.is_empty());
     }
 
     #[test]
@@ -690,7 +771,7 @@ mod tests {
         assert_eq!(prompt["prior_context"], json!([]));
         let mut plan = response(window);
         plan["carry"] = json!([note("unavailable", &[0])]);
-        assert!(parse_plan(&plan.to_string(), window, &carry, &units).is_err());
+        assert!(parse_plan(&plan.to_string(), window, &carry, &units).unwrap().1.is_empty());
     }
 
     #[test]

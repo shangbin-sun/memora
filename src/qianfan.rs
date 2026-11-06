@@ -483,6 +483,8 @@ impl QianfanChat {
             "max_tokens": max_tokens.unwrap_or(self.config.max_tokens),
             "temperature": temperature.unwrap_or(0.2),
             "top_p": self.config.top_p,
+            // Ark and DeepSeek spell it this way; other gateways ignore it.
+            "thinking": {"type": "disabled"},
             "reasoning_split": self.config.reasoning_split,
             // This client is used for extract/ops, not open-ended reasoning.
             "enable_thinking": false,
@@ -925,6 +927,8 @@ impl QianfanGraphExtractor {
                 "max_tokens": 4096,
                 "temperature": 0.2,
                 "top_p": self.config.top_p,
+                // Ark and DeepSeek spell it this way; other gateways ignore it.
+                "thinking": {"type": "disabled"},
                 "reasoning_split": false,
                 // Structured extraction should spend its output budget on JSON,
                 // not a hidden reasoning trace. Compatible gateways ignore extras.

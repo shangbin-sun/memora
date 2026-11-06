@@ -116,6 +116,7 @@ pub fn apply_forgetting(
             rec.updated_at_ms = now;
             update_memory(conn, &mut rec, jieba)?;
             remove_fts(&conn, id)?;
+            crate::chunks::unlink_memory(&conn, &id.to_string())?;
             append_audit(&conn, Some(id), "forget_decay", serde_json::json!({}))?;
             report.forgotten += 1;
         }

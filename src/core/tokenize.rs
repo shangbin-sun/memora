@@ -43,6 +43,17 @@ pub fn fts_match_query_with(jieba: &Jieba, text: &str, extra_words: &[String]) -
             !bare.is_empty()
         })
         .collect();
+    // 语文课 is one query token but the index holds 语文 + 班: also search its parts.
+    for token in jieba.cut(text, true) {
+        if token.chars().count() >= 3 && token.chars().all(|c| ('\u{3400}'..='\u{9fff}').contains(&c)) {
+            for part in jieba.cut_for_search(token, true) {
+                let quoted = format!("\"{part}\"");
+                if part.chars().count() >= 2 && !parts.contains(&quoted) {
+                    parts.push(quoted);
+                }
+            }
+        }
+    }
     for w in extra_words {
         let w = w.trim();
         if w.is_empty() {

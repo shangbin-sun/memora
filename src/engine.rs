@@ -2073,6 +2073,79 @@ impl MemoryEngine {
 }
 
 impl MemoryEngine {
+    /// Persist original excerpts behind already written facts. Called only after the
+    /// facts exist, so a chunk can never appear without a fact to justify it.
+    pub async fn save_chunks(&self, writes: Vec<crate::chunks::ChunkWrite>) -> Result<Vec<String>> {
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _mutation = self.inner.mutation_lock.lock().await;
+        self.ensure_open()?;
+        let pool = self.inner.pool.clone();
+        let jieba = self.inner.jieba.clone();
+        let namespace = self.inner.namespace.clone();
+        tokio::task::spawn_blocking(move || {
+            retry_busy(|| {
+                let mut conn = pool.get()?;
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let mut ids = Vec::with_capacity(writes.len());
+                for write in &writes {
+                    let mut write = write.clone();
+                    if write.namespace.is_empty() {
+                        write.namespace = namespace.clone();
+                    }
+                    ids.push(crate::chunks::save_chunk(&tx, jieba.as_ref(), &write)?);
+                }
+                tx.commit()?;
+                Ok::<_, MemoraError>(ids)
+            })
+        })
+        .await?
+    }
+
+    /// Original excerpts for a recall: behind the recalled facts first, then direct
+    /// text matches. Local only, so it adds no network latency to the recall.
+    pub async fn recall_chunks(
+        &self,
+        query: crate::chunks::ChunkRecallQuery,
+    ) -> Result<Vec<crate::chunks::RecalledChunk>> {
+        self.ensure_open()?;
+        let pool = self.inner.pool.clone();
+        let jieba = self.inner.jieba.clone();
+        let namespace = query.namespace.clone().unwrap_or_else(|| self.inner.namespace.clone());
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get()?;
+            crate::chunks::recall_chunks(&conn, jieba.as_ref(), &namespace, &query)
+        })
+        .await?
+    }
+
+    /// Backend debug view: one memory, where it came from, and its original excerpts.
+    pub async fn memory_trace(&self, id: MemoryId) -> Result<Option<serde_json::Value>> {
+        self.ensure_open()?;
+        let pool = self.inner.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get()?;
+            let Some(record) = get_memory(&conn, id)? else {
+                return Ok(None);
+            };
+            let chunks = crate::chunks::chunks_for_memory(&conn, &id.to_string())?;
+            Ok(Some(serde_json::json!({
+                "id": record.id,
+                "state": record.state,
+                "content": record.content,
+                "subject_ids": record.subject_ids,
+                "tag": record.tag,
+                "session_id": record.session_id,
+                "created_at_ms": record.created_at_ms,
+                "source": record.metadata.get("source"),
+                "speaker_member_id": record.metadata.get("speaker_member_id"),
+                "chunks": chunks,
+            })))
+        })
+        .await?
+    }
+
     /// Persist a memory and its durable graph projection job without awaiting
     /// graph extraction. The job is processed by `retry_graph_projections` / tick.
     /// Compatibility alias for ordinary `remember`, which also defers graph
@@ -2540,6 +2613,9 @@ impl MemoryEngine {
     }
 }
 
+/// Hits that share no word with the question and rest only on vector similarity.
+const MAX_SEMANTIC_ONLY_HITS: usize = 3;
+
 #[async_trait::async_trait]
 impl MemoryService for MemoryEngine {
     async fn remember(&self, input: RememberInput) -> Result<MemoryId> {
@@ -2639,7 +2715,30 @@ impl MemoryService for MemoryEngine {
         performance.mark("stm");
         let jieba = self.inner.jieba.clone();
         // 查询改写：词面扩展进 FTS；问句变体用于多路语义召回。
-        let rewrite = crate::query_rewrite::rewrite_plan(&query.text);
+        let mut rewrite = crate::query_rewrite::rewrite_plan(&query.text);
+        let mut keywords = crate::chunks::query_keywords(jieba.as_ref(), &query.text);
+        // 称呼互通：问“子航”要能找到写着“梁子航”的记忆。
+        let known = self.list_members(Some(&ns)).await.unwrap_or_default();
+        for member in &known {
+            if household::is_shared_member_id(&member.member_id) {
+                continue;
+            }
+            let viewer_says_me = query.text.contains('我')
+                && query.viewer_member_id.as_deref() == Some(member.member_id.as_str());
+            let names: Vec<&str> = std::iter::once(member.display_name.as_str())
+                .chain(std::iter::once(member.member_id.as_str()))
+                .chain(member.aliases.iter().map(String::as_str))
+                .filter(|n| n.chars().count() >= 2 && !household::is_unresolved_owner_id(n))
+                .collect();
+            if viewer_says_me || names.iter().any(|n| query.text.contains(n)) {
+                crate::chunks::merge_person_keyword(&mut keywords, &names);
+                for name in names {
+                    if !rewrite.extra_words.iter().any(|w| w == name) {
+                        rewrite.extra_words.push(name.to_string());
+                    }
+                }
+            }
+        }
         let fts_q = crate::core::tokenize::fts_match_query_with(
             jieba.as_ref(),
             &query.text,
@@ -2664,20 +2763,22 @@ impl MemoryService for MemoryEngine {
                     semantic_ok = true;
                 } else if !query.text.is_empty() {
                     let timeout = self.inner.config.recall_embed_timeout;
-                    let mut any = false;
-                    // 原句 + 问句变体多路召回；QueryEmbeddingCache 按 text 缓存，
-                    // 变体在重复查询时几乎零成本。
-                    for text in rewrite.query_texts(&query.text) {
-                        if let Some(emb) = self
-                            .inner
+                    // 原句 + 问句变体共用一次请求和一个期限。逐个等的话，
+                    // 每个变体都可能吃满一次超时，召回耗时会成倍增加。
+                    let texts: Vec<String> = rewrite
+                        .query_texts(&query.text)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                    query_embs_raw.extend(
+                        self.inner
                             .query_embeddings
-                            .get(embedder.clone(), &ns, text, timeout)
+                            .get_many(embedder.clone(), &ns, &texts, timeout)
                             .await
-                        {
-                            query_embs_raw.push(emb);
-                            any = true;
-                        }
-                    }
+                            .into_iter()
+                            .flatten(),
+                    );
+                    let any = !query_embs_raw.is_empty();
                     semantic_ok = any;
                     if !any {
                         tracing::debug!(
@@ -2744,6 +2845,17 @@ impl MemoryService for MemoryEngine {
         };
 
         let fts_hits = fts_fut.await??;
+        let like_hits = {
+            let pool = self.inner.pool.clone();
+            let ns_like = ns.clone();
+            let like_keywords = keywords.clone();
+            let limit = self.inner.config.fts_top_k;
+            tokio::task::spawn_blocking(move || {
+                let conn = pool.get()?;
+                crate::store::keyword_like_search(&conn, &ns_like, &like_keywords, limit)
+            })
+            .await??
+        };
         performance.mark("local_search");
         let k = self.inner.config.rrf_k;
         let mut fused: HashMap<MemoryId, ScoreBreakdown> = HashMap::new();
@@ -2762,6 +2874,21 @@ impl MemoryService for MemoryEngine {
             });
             e.bm25_rank = Some(rank);
             e.bm25_score = Some(score);
+            e.rrf += rrf(rank, k);
+        }
+        for (rank, id) in like_hits.into_iter().enumerate() {
+            let e = fused.entry(id).or_insert(ScoreBreakdown {
+                bm25_rank: None,
+                bm25_score: None,
+                vector_rank: None,
+                l2: None,
+                rrf: 0.0,
+                decay: 1.0,
+                confidence: 1.0,
+                importance: 1.0,
+                access_boost: 1.0,
+                final_score: 0.0,
+            });
             e.rrf += rrf(rank, k);
         }
         for (rank, (id, dist)) in vec_hits.into_iter().enumerate() {
@@ -2812,6 +2939,45 @@ impl MemoryService for MemoryEngine {
                 .get(id)
                 .is_some_and(|r| recall_matches(r, &query, &ns))
         });
+        // RRF only sees rank, so a row matching just the person's name can outrank the row
+        // that answers the question. Reward covering more of what was asked before capping.
+        let bodies: HashMap<MemoryId, String> = records
+            .iter()
+            .map(|(id, record)| (*id, format!("{} {}", record.content, record.subject_ids.join(" "))))
+            .collect();
+        let weights = crate::chunks::keyword_weights(&keywords, bodies.values().map(String::as_str));
+        let coverage_boost = |id: &MemoryId| -> f64 {
+            let Some(body) = bodies.get(id) else { return 1.0 };
+            let coverage = crate::chunks::weighted_coverage(&keywords, &weights, body);
+            if keywords.is_empty() {
+                1.0
+            } else {
+                let boost = 0.1 + 0.9 * coverage * coverage;
+                boost * boost
+            }
+        };
+        ranked.sort_by(|a, b| {
+            (b.1.rrf * coverage_boost(&b.0))
+                .partial_cmp(&(a.1.rrf * coverage_boost(&a.0)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // A row sharing nothing with the question is noise ("24度" pulling in every "24日").
+        // Vector neighbours may still mean the same thing, so keep only the closest few.
+        if !keywords.is_empty() {
+            let mut semantic_only = 0;
+            ranked.retain(|(id, scores)| {
+                let Some(record) = records.get(id) else { return false };
+                let body = format!("{} {}", record.content, record.subject_ids.join(" "));
+                if crate::chunks::keyword_coverage(&keywords, &body).0 > 0 {
+                    return true;
+                }
+                if scores.vector_rank.is_none() {
+                    return false;
+                }
+                semantic_only += 1;
+                semantic_only <= MAX_SEMANTIC_ONLY_HITS
+            });
+        }
         ranked.truncate(self.inner.config.rrf_merge_k.max(query.top_k.unwrap_or(0)));
         let now = now_ms();
         let kinds = query.kinds.clone();
@@ -2855,6 +3021,7 @@ impl MemoryService for MemoryEngine {
             scores.importance = rec.importance;
             scores.access_boost = access_boost(rec.review_count);
             scores.final_score = scores.rrf
+                * coverage_boost(&id)
                 * scores.confidence
                 * scores.decay
                 * scores.access_boost
@@ -3017,6 +3184,13 @@ impl MemoryService for MemoryEngine {
                     update_memory(&tx, &mut rec, jieba.as_ref())?;
                     remove_fts(&tx, id)?;
                     delete_embedding(&tx, id)?;
+                    // A user forget also retires the excerpt holding that text.
+                    match &reason {
+                        crate::types::ForgetReason::User { .. } => {
+                            crate::chunks::forget_chunks_of_memory(&tx, &id.to_string())?
+                        }
+                        _ => crate::chunks::unlink_memory(&tx, &id.to_string())?,
+                    }
                     insert_version(&tx, id, "forget", None, &rec, "user", Some("forget"))?;
                     append_audit(
                         &tx,

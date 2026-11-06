@@ -12,6 +12,8 @@
 //! ```
 
 mod candidate_recall;
+pub mod chunks;
+pub mod question_turn;
 mod classify;
 mod config;
 mod core;
@@ -59,6 +61,7 @@ pub use household::{
     complete_owned_content, ground_owner_from_source, infer_content_owner, is_shared_member_id,
     HouseholdMember, MemberRole, MemoryTag, DEFAULT_TAGS, PUBLIC_MEMBER_ID,
 };
+pub use query_rewrite::contextual_query;
 pub use prompts::{bundle as prompt_bundle, latest as prompt_latest, output_budget, PromptBundle};
 pub use qianfan::QianfanGraphExtractor;
 pub use qianfan::{

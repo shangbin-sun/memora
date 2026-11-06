@@ -30,7 +30,27 @@ const SYNONYM_GROUPS: &[&[&str]] = &[
     &["女儿", "孩子", "子女"],
     &["哥哥", "兄长"],
     &["生日", "出生日期", "出生"],
-    &["学校", "就读学校"],
+    &["学校", "就读学校", "小学", "中学", "上学", "就读"],
+    // 家庭常问的说法和资料里的写法不一样；向量超时时全靠这里兜底。
+    &["这周", "本周", "这星期", "一周"],
+    &["花费", "消费", "支出", "花销", "开销", "花了"],
+    &["付款", "支付", "付了", "付的钱"],
+    &["职业", "工作", "工程师", "公务员"],
+    &["诊断", "疾病", "什么病", "患有"],
+    &["用药", "吃药", "什么药", "服用", "处方"],
+    &["复诊", "复查"],
+    &["错题", "做错", "错得", "错了", "错误"],
+    &["数学", "分数", "通分", "运算", "方程", "几何", "应用题"],
+    &["收入", "工资", "月薪", "挣多少", "挣钱"],
+    &["持仓", "投资", "理财", "本金"],
+    &["违章", "超速", "违法", "罚款"],
+    &["保险", "保单", "续保"],
+    &["保养", "维修", "换机油"],
+    &["车位", "停车位"],
+    &["课程", "上课", "上课时间", "什么时候上", "什么课"],
+    &["学费", "课程费", "报班"],
+    &["贷款", "房贷", "车贷", "还款", "月供"],
+    &["过敏", "忌口"],
 ];
 
 const QUESTION_WORDS: &[&str] = &[
@@ -64,6 +84,36 @@ pub fn expand_word(word: &str) -> &'static [&'static str] {
         }
     }
     &[]
+}
+
+/// 句子里出现了哪些同义词组。按子串找，不依赖分词：jieba 可能把“这周”切成“这/周”。
+pub fn synonym_groups_in(text: &str) -> Vec<&'static [&'static str]> {
+    SYNONYM_GROUPS
+        .iter()
+        .copied()
+        .filter(|group| group.iter().any(|word| text.contains(word)))
+        .collect()
+}
+
+/// 多轮追问（“那语文呢”“他吃什么药”）单看本句查不到，要带上上一句。
+/// 明确的新问题不带，否则上一轮的话题会污染这一轮的结果。
+pub fn contextual_query(text: &str, previous: Option<&str>) -> String {
+    let current = text.trim();
+    let Some(previous) = previous.map(str::trim).filter(|p| !p.is_empty() && *p != current) else {
+        return current.to_string();
+    };
+    let chars = current.chars().count();
+    let starts_elliptical = ["那", "他", "她", "它", "这", "还有", "另外", "具体", "然后", "那么"]
+        .iter()
+        .any(|w| current.starts_with(w));
+    let has_pronoun = ["他", "她", "它", "这个", "那个", "这家", "那家", "这门", "那门"]
+        .iter()
+        .any(|w| current.contains(w));
+    if chars <= 6 || starts_elliptical || has_pronoun || current.ends_with('呢') {
+        format!("{previous} {current}")
+    } else {
+        current.to_string()
+    }
 }
 
 /// 改写计划。
@@ -126,6 +176,10 @@ pub fn rewrite_plan(text: &str) -> RewritePlan {
     let mut matches: Vec<(usize, usize, &'static str)> = Vec::new(); // (start_char, len_chars, word)
     for word in words {
         let wlen = word.chars().count();
+        // A question shorter than the synonym ("几点了" vs "出生日期") cannot contain it.
+        if wlen > chars.len() {
+            continue;
+        }
         for start in 0..=(chars.len() - wlen) {
             let slice: String = chars[start..start + wlen].iter().collect();
             if slice != *word {
@@ -205,6 +259,23 @@ mod tests {
         let plan = rewrite_plan(text);
         assert!(plan.variants.is_empty(), "长文本不做变体改写");
         assert!(!plan.extra_words.is_empty(), "但词面扩展仍然有效");
+    }
+
+    #[test]
+    fn questions_shorter_than_any_synonym_do_not_panic() {
+        for text in ["谁", "几点了", "子航呢", "多少钱"] {
+            assert!(rewrite_plan(text).variants.is_empty());
+        }
+        assert_eq!(rewrite_plan("妈妈呢").variants, vec!["母亲呢".to_string()]);
+    }
+
+    #[test]
+    fn follow_ups_carry_the_previous_question_and_new_questions_do_not() {
+        let previous = Some("子航的数学课还剩几节");
+        assert_eq!(contextual_query("那语文呢", previous), "子航的数学课还剩几节 那语文呢");
+        assert_eq!(contextual_query("他吃什么药", Some("梁建国是什么病")), "梁建国是什么病 他吃什么药");
+        assert_eq!(contextual_query("家里的车保险什么时候到期", previous), "家里的车保险什么时候到期");
+        assert_eq!(contextual_query("那语文呢", None), "那语文呢");
     }
 
     #[test]

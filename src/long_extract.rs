@@ -22,6 +22,7 @@ use tokio::time::Instant;
 const SHORT_SOURCE_CHARS: usize = 300;
 const HARD_WINDOW_CHARS: usize = 2_500;
 const HARD_WINDOW_OVERLAP: usize = 100;
+const TARGET_CHUNK_CHARS: usize = 1_200;
 
 /// Character-count hard cuts, including the overlap inside the 2500-char cap.
 /// The tail always follows planning even when it contains <=300 characters.
@@ -246,6 +247,10 @@ pub(crate) struct StageLimits {
     pub model_calls: usize,
     pub chunk_calls: usize,
     pub subdivision_depth: usize,
+    /// Merge planned blocks up to this size; 0 keeps the model's blocks as they are.
+    pub merge_chars: usize,
+    /// Split structurally when no usable plan comes back, instead of losing the window.
+    pub structural_fallback: bool,
 }
 
 impl Default for StageLimits {
@@ -255,8 +260,15 @@ impl Default for StageLimits {
             model_calls: MAX_MODEL_CALLS,
             chunk_calls: MAX_CHUNK_CALLS,
             subdivision_depth: MAX_SUBDIVISION_DEPTH,
+            merge_chars: 0,
+            structural_fallback: false,
         }
     }
+}
+
+/// What a host actually runs. Tests opt in to these separately.
+fn production_limits() -> StageLimits {
+    StageLimits { merge_chars: TARGET_CHUNK_CHARS, structural_fallback: true, ..StageLimits::default() }
 }
 
 pub(crate) async fn stage_source(
@@ -264,7 +276,7 @@ pub(crate) async fn stage_source(
     source: EvidenceSource,
     context: ExtractContext,
 ) -> StagedSource {
-    stage_source_with_model(&chat, source, context, StageLimits::default()).await
+    stage_source_with_model(&chat, source, context, production_limits()).await
 }
 
 /// Explicit user-triggered resume starts one new bounded source deadline. Only
@@ -276,7 +288,7 @@ pub(crate) async fn resume_source(
     context: ExtractContext,
     previous: StagedSource,
 ) -> StagedSource {
-    resume_source_with_model(&chat, source, context, previous, StageLimits::default()).await
+    resume_source_with_model(&chat, source, context, previous, production_limits()).await
 }
 
 pub(crate) async fn stage_source_with_model<M: ExtractionModel>(
@@ -315,7 +327,18 @@ pub(crate) async fn stage_source_with_model<M: ExtractionModel>(
                     run.output.parts.push(part);
                     continue;
                 }
-                match run.plan(&window, &carry, false, None).await {
+                let planned = match run.plan(&window, &carry, false, None).await {
+                    Ok((chunks, next)) if run.limits.merge_chars > 0 => Ok((
+                        extraction_plan::merge_small_chunks(chunks, &window, run.limits.merge_chars),
+                        next,
+                    )),
+                    Err(error) if run.limits.structural_fallback && run.stopped.is_none() => {
+                        run.output.warnings.push(format!("来源 {} 规划不可用，已按结构分块：{error}", run.root.id));
+                        Ok((extraction_plan::structural_chunks(&window, TARGET_CHUNK_CHARS), carry.clone()))
+                    }
+                    other => other,
+                };
+                match planned {
                     Ok((chunks, next)) => {
                         carry = next;
                         for chunk in chunks {
@@ -758,13 +781,18 @@ impl<'a, M: ExtractionModel> Run<'a, M> {
                     .await
                 {
                     Ok(completion) => {
-                        let parsed = parse_extraction(
+                        let mut parsed = parse_extraction(
                             &completion.text,
                             &source.id,
                             &source.text,
                             completion.truncated,
                         );
                         self.output.invalid_attempt_records += parsed.invalid_records;
+                        // Retrying a finished reply again will not fix a stray line. Keep the
+                        // valid records; bad lines stay dropped and counted.
+                        if attempt == 1 && parsed.marker_ok && !completion.truncated {
+                            parsed.complete = true;
+                        }
                         let complete = parsed.complete;
                         let mut part = StagedPart {
                             source: source.clone(),
@@ -1120,6 +1148,8 @@ mod tests {
             locator: Some("page:7".into()),
             truncated: false,
             graph_already_ingested: true,
+            preserve_original: false,
+            file_path: None,
         }
     }
     fn ctx() -> ExtractContext {
@@ -1392,8 +1422,10 @@ mod tests {
             done("张三有车", "张三有车"),
         ]);
         let staged = stage_source_with_model(&model, source, ctx(), StageLimits::default()).await;
+        // Evidence outside the block never gets in, however often the model repeats it.
+        // The block itself is finished: a third identical answer would change nothing.
         assert!(staged.parts[0].parsed.memories.is_empty());
-        assert!(!staged.parts[0].parsed.complete);
+        assert!(staged.parts[0].parsed.complete);
         assert_eq!(staged.invalid_attempt_records, 2);
     }
 

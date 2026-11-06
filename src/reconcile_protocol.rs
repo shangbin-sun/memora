@@ -13,6 +13,9 @@ pub(crate) struct ParsedExtraction {
     pub retractions: Vec<Value>,
     pub invalid_records: usize,
     pub complete: bool,
+    /// The reply ended with its single completion marker (bad lines may remain).
+    #[serde(default)]
+    pub marker_ok: bool,
 }
 
 /// Parse compact JSONL, or a complete legacy extraction object.
@@ -65,8 +68,8 @@ pub(crate) fn parse_extraction(
         };
         push_item(&mut parsed, kind, item);
     }
-    parsed.complete =
-        !truncated && parsed.invalid_records == 0 && marker_count == 1 && last_was_marker;
+    parsed.marker_ok = marker_count == 1 && last_was_marker;
+    parsed.complete = !truncated && parsed.invalid_records == 0 && parsed.marker_ok;
     suppress_partial_controls(&mut parsed);
     parsed
 }
@@ -140,6 +143,59 @@ fn exact_evidence(evidence: &str, source_id: &str, source_text: &str) -> bool {
     !source_id.trim().is_empty() && source_text.contains(evidence)
 }
 
+fn folded(ch: char) -> Option<char> {
+    match ch {
+        c if c.is_whitespace() => None,
+        '|' | '*' | '`' | ',' | '，' | '、' => None,
+        '：' => Some(':'),
+        '；' => Some(';'),
+        '（' => Some('('),
+        '）' => Some(')'),
+        '。' => Some('.'),
+        '－' | '−' | '–' | '—' => Some('-'),
+        '×' => Some('x'),
+        c => Some(c),
+    }
+}
+
+/// Fold formatting that models normally smooth over, keeping the byte range of each
+/// surviving character so a match can be mapped back onto the original text.
+fn folded_with_offsets(text: &str) -> (Vec<char>, Vec<(usize, usize)>) {
+    let cleaned = text;
+    let mut chars = Vec::new();
+    let mut spans = Vec::new();
+    let mut iter = cleaned.char_indices().peekable();
+    while let Some((start, ch)) = iter.next() {
+        if cleaned[start..].starts_with("<br>") {
+            for _ in 0..3 {
+                iter.next();
+            }
+            continue;
+        }
+        if let Some(folded) = folded(ch) {
+            chars.push(folded);
+            spans.push((start, start + ch.len_utf8()));
+        }
+    }
+    (chars, spans)
+}
+
+/// Models quote across table cells, or write a number or dash differently. That is
+/// still the same original passage, so the evidence is restored to the exact slice.
+/// A real paraphrase still fails, which is what the check is there to catch.
+pub(crate) fn resolve_evidence(evidence: &str, source_text: &str) -> Option<String> {
+    if source_text.contains(evidence) {
+        return Some(evidence.to_string());
+    }
+    let (needle, _) = folded_with_offsets(evidence);
+    if needle.len() < 2 {
+        return None;
+    }
+    let (haystack, spans) = folded_with_offsets(source_text);
+    let index = haystack.windows(needle.len()).position(|window| window == needle.as_slice())?;
+    Some(source_text[spans[index].0..spans[index + needle.len() - 1].1].to_string())
+}
+
 fn forbidden_compact_field(key: &str) -> bool {
     key.starts_with("_host")
         || matches!(
@@ -172,7 +228,8 @@ fn normalize_compact(
         Some(Value::String(kind)) if kind == "f" => Kind::Retraction,
         _ => return None,
     };
-    let evidence = required_string(object, "e")?;
+    let evidence = resolve_evidence(required_string(object, "e")?, source_text)?;
+    let evidence = evidence.as_str();
     if !exact_evidence(evidence, source_id, source_text) {
         return None;
     }
@@ -601,7 +658,7 @@ mod tests {
             row.as_object_mut().unwrap().remove(field);
             invalid.push(row);
         }
-        for evidence in ["小航面条", "喜欢 面条", "小航喜欢面条！"] {
+        for evidence in ["小航面条", "小航喜欢面条！"] {
             let mut row = memory_row();
             row["e"] = json!(evidence);
             invalid.push(row);
@@ -633,6 +690,22 @@ mod tests {
         );
         assert_eq!(parsed.invalid_records, 1);
         assert!(parsed.memories.is_empty());
+    }
+
+    #[test]
+    fn evidence_tolerates_formatting_but_not_paraphrase() {
+        let row = "| TX019 | 10-14<br>21:18 | 爸爸 → 爸爸 | 智能手表：个人自用<br>电子产品｜数码商城 | 899.00 |";
+        // Across table cells and <br>: restored to the exact original slice.
+        let found = resolve_evidence("10-14 21:18 爸爸 → 爸爸", row).unwrap();
+        assert_eq!(found, "10-14<br>21:18 | 爸爸 → 爸爸");
+        assert!(row.contains(&found));
+        // Dash, full-width punctuation and thousands separators.
+        assert_eq!(resolve_evidence("5/6-1/3", "题目 5/6 − 1/3 通分").unwrap(), "5/6 − 1/3");
+        assert_eq!(resolve_evidence("8446.00元", "合计 8,446.00元。").unwrap(), "8,446.00元");
+        // A rewrite or reorder is still not evidence.
+        assert!(resolve_evidence("手表899元", row).is_none());
+        assert!(resolve_evidence("爸爸买了智能手表", row).is_none());
+        assert!(resolve_evidence("，", row).is_none());
     }
 
     #[test]
