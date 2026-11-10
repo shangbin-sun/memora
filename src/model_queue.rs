@@ -151,4 +151,22 @@ mod tests {
         server.join().unwrap();
         assert!(tokio::time::timeout(std::time::Duration::from_secs(1), acquire(true)).await.is_ok());
     }
+
+    #[tokio::test]
+    async fn serial_queue_wait_does_not_consume_chat_execution_budget() {
+        let held = acquire(true).await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = crate::QianfanConfig::for_embed("local".into(),None,None,None);
+        cfg.chat_url = format!("http://{}",listener.local_addr().unwrap());
+        drop(listener);
+        let chat = crate::QianfanChat::new(cfg).unwrap().with_serial_requests(true);
+        let waiting = tokio::spawn(async move {
+            chat.complete_with_timeout(None,"text",Some(8),None,std::time::Duration::from_millis(20)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(!waiting.is_finished(), "排队时不能耗尽20ms的执行预算");
+        drop(held);
+        // 不存在的测试端口使请求失败，仍须归还许可。
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2),waiting).await.unwrap().unwrap().is_err());
+    }
 }

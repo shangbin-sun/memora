@@ -469,6 +469,8 @@ impl QianfanChat {
         request_timeout: std::time::Duration,
         mode: ChatResponseMode,
     ) -> Result<ExtractionCompletion> {
+        // 队列等待不消耗单次推理预算；本阶段重试结束后再交给下一任务。
+        let _model_permit = crate::model_queue::acquire(self.serial_requests).await;
         tokio::time::timeout(request_timeout, async {
             let _permit = self
                 .permits
@@ -524,7 +526,6 @@ impl QianfanChat {
             let api_key = api_key.clone();
             let body = body.clone();
             async move {
-                let _model_permit = crate::model_queue::acquire(self.serial_requests).await;
                 let resp = client
                     .post(&chat_url)
                     .timeout(request_timeout)
@@ -958,7 +959,6 @@ impl QianfanGraphExtractor {
             .await
             .map_err(|_| MemoraError::Other("kg request limiter closed".into()))?;
         budget.claim()?;
-        let _model_permit = crate::model_queue::acquire(self.serial_requests).await;
         let resp = self
             .client
             .post(&self.config.chat_url)
@@ -1142,6 +1142,7 @@ impl GraphExtractor for QianfanGraphExtractor {
     }
 
     async fn extract(&self, input: GraphExtractInput) -> Result<GraphExtractOutput> {
+        let _model_permit = crate::model_queue::acquire(self.serial_requests).await;
         let budget = std::sync::Arc::new(GraphRequestBudget {
             issued: AtomicUsize::new(0),
             maximum: self.limits.max_requests,
