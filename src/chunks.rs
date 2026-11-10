@@ -1,8 +1,5 @@
-//! Third memory type: original txt/md excerpts behind attachment facts.
-//!
-//! A chunk only exists because at least one validated fact was extracted from it,
-//! and it inherits people and tags from those facts. Chunks are never recalled on
-//! their own authority: every read requires an active, viewer-visible linked fact.
+//! Original txt/md excerpts retained only for fact provenance.
+//! They are not memories and never participate in recall.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -12,10 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::core::{now_ms, tokenize_for_fts};
+use crate::core::now_ms;
 use crate::error::Result;
-use crate::household;
-use crate::store::{get_memory, memory_is_recallable};
 
 #[derive(Debug, Clone, Default)]
 pub struct ChunkWrite {
@@ -103,7 +98,7 @@ fn merge_sorted(existing: Vec<String>, new: &[String]) -> Vec<String> {
 
 /// Insert or merge one chunk. Identical text (a re-upload, or the overlap of two
 /// hard windows) stays a single row and gains the new links, people and tags.
-pub fn save_chunk(conn: &Connection, jieba: &Jieba, chunk: &ChunkWrite) -> Result<String> {
+pub fn save_chunk(conn: &Connection, _jieba: &Jieba, chunk: &ChunkWrite) -> Result<String> {
     let now = now_ms();
     let sha = hash_text(&chunk.content);
     let existing: Option<(String, Option<String>, Option<String>)> = conn
@@ -161,10 +156,6 @@ pub fn save_chunk(conn: &Connection, jieba: &Jieba, chunk: &ChunkWrite) -> Resul
                     chunk.end_char,
                     now
                 ],
-            )?;
-            conn.execute(
-                "INSERT INTO memory_chunk_fts(chunk_id, content) VALUES(?1, ?2)",
-                params![id, tokenize_for_fts(jieba, &chunk.content)],
             )?;
             id
         }
@@ -227,33 +218,6 @@ pub fn chunks_for_memory(conn: &Connection, memory_id: &str) -> Result<Vec<Chunk
         }
     }
     Ok(out)
-}
-
-/// A chunk may hold several facts, so one hidden or foreign fact hides the excerpt.
-fn chunk_readable(conn: &Connection, chunk: &ChunkRecord, query: &ChunkRecallQuery) -> Result<bool> {
-    let mut any_active = false;
-    for memory_id in &chunk.memory_ids {
-        let Ok(id) = Uuid::parse_str(memory_id) else { continue };
-        let Some(record) = get_memory(conn, id)? else { continue };
-        if !memory_is_recallable(&record) {
-            continue;
-        }
-        any_active = true;
-        if !household::visible_to_viewer(
-            &record.metadata,
-            &record.subject_ids,
-            query.viewer_member_id.as_deref(),
-        ) {
-            return Ok(false);
-        }
-    }
-    if !any_active {
-        return Ok(false);
-    }
-    if let Some(member) = query.member_id.as_deref().filter(|m| !m.trim().is_empty()) {
-        return Ok(chunk.subject_ids.iter().any(|s| s == member));
-    }
-    Ok(true)
 }
 
 const QUESTION_WORDS: &[&str] = &[
@@ -400,124 +364,18 @@ pub fn weighted_coverage(keywords: &[String], weights: &[f64], content: &str) ->
     found / total
 }
 
-fn clip(content: &str, focus: Option<&str>, keywords: &[String], max_chars: usize) -> (String, bool) {
-    let chars: Vec<char> = content.chars().collect();
-    if chars.len() <= max_chars {
-        return (content.to_string(), false);
-    }
-    let anchor = focus
-        .filter(|f| !f.is_empty())
-        .and_then(|f| content.find(f))
-        .or_else(|| keywords.iter().flat_map(|k| k.split(ALTERNATIVE)).find_map(|k| content.find(k)));
-    let center = anchor.map_or(0, |byte| content[..byte].chars().count());
-    let half = max_chars / 2;
-    let start = center.saturating_sub(half).min(chars.len() - max_chars);
-    let end = start + max_chars;
-    let mut text: String = chars[start..end].iter().collect();
-    if start > 0 {
-        text.insert(0, '…');
-    }
-    if end < chars.len() {
-        text.push('…');
-    }
-    (text, true)
-}
-
-/// Facts first, then direct text matches. Local SQL only, no network call.
+/// Compatibility entry point for older hosts. Original excerpts are available
+/// only through fact provenance (`chunks_for_memory` / `memory_trace`).
 pub fn recall_chunks(
-    conn: &Connection,
-    jieba: &Jieba,
-    namespace: &str,
-    query: &ChunkRecallQuery,
+    _conn: &Connection,
+    _jieba: &Jieba,
+    _namespace: &str,
+    _query: &ChunkRecallQuery,
 ) -> Result<Vec<RecalledChunk>> {
-    if query.top_k == 0 || query.max_chars == 0 {
-        return Ok(Vec::new());
-    }
-    let keywords = query_keywords(jieba, &query.text);
-    let mut picked: Vec<(ChunkRecord, String, Option<String>)> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for memory_id in &query.hit_memory_ids {
-        if picked.len() >= query.top_k {
-            break;
-        }
-        let focus = query
-            .hit_evidence
-            .iter()
-            .find(|(id, _)| id == memory_id)
-            .map(|(_, evidence)| evidence.clone());
-        for chunk in chunks_for_memory(conn, memory_id)? {
-            if picked.len() >= query.top_k {
-                break;
-            }
-            if seen.insert(chunk.id.clone()) && chunk_readable(conn, &chunk, query)? {
-                picked.push((chunk, "linked".into(), focus.clone()));
-            }
-        }
-    }
-    if picked.len() < query.top_k && !keywords.is_empty() {
-        let match_query = keywords
-            .iter()
-            .flat_map(|k| k.split(ALTERNATIVE))
-            .map(|k| format!("\"{}\"", k.replace('"', " ")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let mut stmt = conn.prepare(
-            r#"SELECT f.chunk_id FROM memory_chunk_fts f JOIN memory_chunks c ON c.id = f.chunk_id
-               WHERE memory_chunk_fts MATCH ?1 AND c.namespace = ?2 ORDER BY bm25(memory_chunk_fts) LIMIT 20"#,
-        )?;
-        let ids: Vec<String> = stmt
-            .query_map(params![match_query, namespace], |r| r.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        let mut scored = Vec::new();
-        for id in ids {
-            if seen.contains(&id) {
-                continue;
-            }
-            let Some(chunk) = get_chunk(conn, &id)? else { continue };
-            let (hits, coverage) = keyword_coverage(&keywords, &chunk.content);
-            let enough = if keywords.len() == 1 { hits == 1 } else { hits >= 2 && coverage >= 0.5 };
-            if enough && chunk_readable(conn, &chunk, query)? {
-                scored.push((coverage, chunk));
-            }
-        }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        for (_, chunk) in scored {
-            if picked.len() >= query.top_k {
-                break;
-            }
-            seen.insert(chunk.id.clone());
-            picked.push((chunk, "text".into(), None));
-        }
-    }
-    let share = (query.max_chars / picked.len().max(1)).max(1);
-    Ok(picked
-        .into_iter()
-        .map(|(chunk, matched_by, focus)| {
-            let (text, clipped) = clip(&chunk.content, focus.as_deref(), &keywords, share);
-            RecalledChunk {
-                id: chunk.id,
-                text,
-                clipped,
-                subject_ids: chunk.subject_ids,
-                tags: chunk.tags,
-                source_kind: chunk.source_kind,
-                source_name: chunk.source_name,
-                source_path: chunk.source_path,
-                source_locator: chunk.source_locator,
-                session_id: chunk.session_id,
-                message_id: chunk.message_id,
-                start_char: chunk.start_char,
-                end_char: chunk.end_char,
-                memory_ids: chunk.memory_ids,
-                matched_by,
-            }
-        })
-        .collect())
+    Ok(Vec::new())
 }
 
 fn delete_chunk(conn: &Connection, chunk_id: &str) -> Result<()> {
-    conn.execute("DELETE FROM memory_chunk_fts WHERE chunk_id = ?1", params![chunk_id])?;
     conn.execute("DELETE FROM memory_chunk_links WHERE chunk_id = ?1", params![chunk_id])?;
     conn.execute("DELETE FROM memory_chunks WHERE id = ?1", params![chunk_id])?;
     Ok(())
@@ -602,33 +460,47 @@ mod tests {
     }
 
     #[test]
-    fn hits_bring_their_chunk_and_text_match_needs_real_coverage() {
+    fn excerpts_are_traceable_but_never_recalled() {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
         let jieba = Jieba::new();
         let id = Uuid::now_v7();
         memory(&conn, &id, "小航", "{}");
-        save_chunk(&conn, &jieba, &write("梁子航每周六有分数运算测试，主要巩固通分。", vec![id.to_string()])).unwrap();
-        let mut linked = query("无关的话");
+        let content = "梁子航每周六有分数运算测试，主要巩固通分。";
+        let chunk_id = save_chunk(&conn, &jieba, &write(content, vec![id.to_string()])).unwrap();
+        let mut linked = query("分数运算测试");
         linked.hit_memory_ids = vec![id.to_string()];
-        let found = recall_chunks(&conn, &jieba, "default", &linked).unwrap();
-        assert_eq!(found[0].matched_by, "linked");
-        let found = recall_chunks(&conn, &jieba, "default", &query("分数运算测试是周几")).unwrap();
-        assert_eq!(found[0].matched_by, "text");
-        assert!(recall_chunks(&conn, &jieba, "default", &query("今天天气怎么样")).unwrap().is_empty());
+        linked.hit_evidence = vec![(id.to_string(), "分数运算测试".into())];
+        assert!(recall_chunks(&conn, &jieba, "default", &linked).unwrap().is_empty());
+        assert!(recall_chunks(&conn, &jieba, "default", &query("分数运算测试")).unwrap().is_empty());
+        let traced = chunks_for_memory(&conn, &id.to_string()).unwrap();
+        assert_eq!(traced.len(), 1);
+        assert_eq!(traced[0].id, chunk_id);
+        assert_eq!(traced[0].content, content);
+        assert_eq!(traced[0].source_path.as_deref(), Some("/data/家庭.md"));
     }
 
     #[test]
-    fn retired_facts_hide_the_shared_excerpt() {
+    fn v11_upgrade_removes_search_index_and_preserves_provenance() {
         let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
+        for sql in &crate::store::MIGRATION_SQL[..11] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 11).unwrap();
         let jieba = Jieba::new();
         let id = Uuid::now_v7();
         memory(&conn, &id, "小航", "{}");
-        save_chunk(&conn, &jieba, &write("小航过敏，爸爸服药", vec![id.to_string()])).unwrap();
-        assert_eq!(recall_chunks(&conn, &jieba, "default", &query("小航过敏")).unwrap().len(), 1);
-        conn.execute("UPDATE memories SET state = 'forgotten'", []).unwrap();
-        assert!(recall_chunks(&conn, &jieba, "default", &query("小航过敏")).unwrap().is_empty());
+        let chunk = save_chunk(&conn, &jieba, &write("历史原文保留", vec![id.to_string()])).unwrap();
+        conn.execute("INSERT INTO memory_chunk_fts(chunk_id,content) VALUES(?1,?2)", params![chunk, "历史 原文 保留"]).unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        let indexes: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'memory_chunk_fts' OR name GLOB 'memory_chunk_fts_*'", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexes, 0);
+        assert_eq!(chunks_for_memory(&conn, &id.to_string()).unwrap()[0].content, "历史原文保留");
+        assert_eq!(get_chunk(&conn, &chunk).unwrap().unwrap().memory_ids, vec![id.to_string()]);
+        assert!(recall_chunks(&conn, &jieba, "default", &query("历史原文")).unwrap().is_empty());
+        save_chunk(&conn, &jieba, &write("新增原文保留", vec![id.to_string()])).unwrap();
+        assert_eq!(chunks_for_memory(&conn, &id.to_string()).unwrap().len(), 2);
     }
 
     #[test]
@@ -644,15 +516,8 @@ mod tests {
         let chunk = save_chunk(&conn, &jieba, &write("原文乙", vec!["c".into(), "d".into()])).unwrap();
         forget_chunks_of_memory(&conn, "c").unwrap();
         assert!(get_chunk(&conn, &chunk).unwrap().is_none());
-        let fts: i64 = conn.query_row("SELECT count(*) FROM memory_chunk_fts", [], |r| r.get(0)).unwrap();
+        let fts: i64 = conn.query_row("SELECT count(*) FROM memory_chunks", [], |r| r.get(0)).unwrap();
         assert_eq!(fts, 0);
     }
 
-    #[test]
-    fn clip_keeps_budget_and_centers_on_evidence() {
-        let body = format!("{}目标句{}", "甲".repeat(500), "乙".repeat(500));
-        let (text, clipped) = clip(&body, Some("目标句"), &[], 100);
-        assert!(clipped && text.contains("目标句"));
-        assert!(text.chars().count() <= 102);
-    }
 }

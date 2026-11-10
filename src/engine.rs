@@ -2105,21 +2105,14 @@ impl MemoryEngine {
         .await?
     }
 
-    /// Original excerpts for a recall: behind the recalled facts first, then direct
-    /// text matches. Local only, so it adds no network latency to the recall.
+    /// Compatibility with older callers: original excerpts never enter recall.
+    /// Use `memory_trace` with a fact ID to inspect its provenance.
     pub async fn recall_chunks(
         &self,
-        query: crate::chunks::ChunkRecallQuery,
+        _query: crate::chunks::ChunkRecallQuery,
     ) -> Result<Vec<crate::chunks::RecalledChunk>> {
         self.ensure_open()?;
-        let pool = self.inner.pool.clone();
-        let jieba = self.inner.jieba.clone();
-        let namespace = query.namespace.clone().unwrap_or_else(|| self.inner.namespace.clone());
-        tokio::task::spawn_blocking(move || {
-            let conn = pool.get()?;
-            crate::chunks::recall_chunks(&conn, jieba.as_ref(), &namespace, &query)
-        })
-        .await?
+        Ok(Vec::new())
     }
 
     /// Backend debug view: one memory, where it came from, and its original excerpts.

@@ -368,13 +368,9 @@ struct RecallBody {
     #[serde(default)]
     fts_only: bool,
     timeout_ms: Option<u64>,
-    /// Also return original excerpts behind the hits (third memory type).
+    /// Legacy option: accepted for compatibility, but chunks are always empty.
     #[serde(default)]
     include_chunks: bool,
-    #[serde(default)]
-    chunk_top_k: Option<usize>,
-    #[serde(default)]
-    chunk_max_chars: Option<usize>,
     /// Previous user utterance, used only to resolve follow-ups like "那语文呢".
     #[serde(default)]
     previous_query: Option<String>,
@@ -829,14 +825,8 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_recall(
     };
 
     let timeout = Duration::from_millis(body.timeout_ms.unwrap_or(2000).clamp(100, 5000));
-    let chunk_options = body
-        .include_chunks
-        .then(|| (body.chunk_top_k.unwrap_or(2), body.chunk_max_chars.unwrap_or(2_000)));
+    let include_chunks = body.include_chunks;
     let contextual = crate::contextual_query(&body.text, body.previous_query.as_deref());
-    let chunk_text = contextual.clone();
-    let chunk_namespace = body.namespace.clone();
-    let chunk_viewer = body.viewer_member_id.clone();
-    let chunk_member = body.member_id.clone();
     let query = RecallQuery {
         text: contextual,
         namespace: body.namespace,
@@ -866,33 +856,14 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_recall(
     });
     match result {
         Ok(result) => {
-            let encoded = match chunk_options {
-                None => serde_json::to_string(&result),
-                Some((top_k, max_chars)) => {
-                    let chunk_query = crate::chunks::ChunkRecallQuery {
-                        text: chunk_text,
-                        namespace: chunk_namespace,
-                        hit_memory_ids: result.hits.iter().map(|h| h.memory.id.to_string()).collect(),
-                        hit_evidence: result
-                            .hits
-                            .iter()
-                            .filter_map(|h| {
-                                let evidence = h.memory.metadata.get("source")?.get("evidence")?.as_str()?;
-                                Some((h.memory.id.to_string(), evidence.to_string()))
-                            })
-                            .collect(),
-                        viewer_member_id: chunk_viewer,
-                        member_id: chunk_member,
-                        top_k,
-                        max_chars,
-                    };
-                    // An excerpt failure must never cost the recalled facts.
-                    let chunks = runtime().block_on(engine.recall_chunks(chunk_query)).unwrap_or_default();
-                    serde_json::to_value(&result).and_then(|mut value| {
-                        value["chunks"] = serde_json::to_value(&chunks)?;
-                        serde_json::to_string(&value)
-                    })
-                }
+            let encoded = if include_chunks {
+                // Keep the legacy response shape without reading original text.
+                serde_json::to_value(&result).and_then(|mut value| {
+                    value["chunks"] = serde_json::json!([]);
+                    serde_json::to_string(&value)
+                })
+            } else {
+                serde_json::to_string(&result)
             };
             match encoded {
                 Ok(s) => to_jstring(&mut env, s),
@@ -1713,6 +1684,45 @@ mod contract_tests {
             let result = engine.recall(RecallQuery {text:"周六".into(),member_id:Some("公共".into()),
                 viewer_member_id:Some("李四".into()),fts_only:true,skip_graph:true,..Default::default()}).await.unwrap();
             assert!(result.hits.is_empty());
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn fact_recall_excludes_original_text_while_trace_survives_reopen() {
+        runtime().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("provenance.db");
+            let engine = MemoryEngine::builder().db_path(&db)
+                .graph_projection_worker(false).build().await.unwrap();
+            let body: RememberBody = serde_json::from_value(json!({
+                "content":"全家每周六清洁客厅", "subjects":["公共"]
+            })).unwrap();
+            let id = engine.remember(remember_input(body).unwrap()).await.unwrap();
+            let original = "全家每周六清洁客厅。紫罗兰保险柜口令只在原文中，未提取为事实。";
+            engine.save_chunks(vec![crate::chunks::ChunkWrite {
+                content: original.into(), source_kind: "document".into(),
+                source_name: "家庭.md".into(), memory_ids: vec![id.to_string()],
+                ..Default::default()
+            }]).await.unwrap();
+            engine.shutdown();
+            drop(engine);
+            let engine = MemoryEngine::builder().db_path(&db)
+                .graph_projection_worker(false).build().await.unwrap();
+            let fact = engine.recall(RecallQuery {text:"清洁客厅".into(),fts_only:true,
+                skip_graph:true,..Default::default()}).await.unwrap();
+            assert_eq!(fact.hits.len(), 1);
+            assert_eq!(fact.hits[0].memory.id, id);
+            let absent = engine.recall(RecallQuery {text:"紫罗兰保险柜口令".into(),fts_only:true,
+                skip_graph:true,..Default::default()}).await.unwrap();
+            assert!(absent.hits.is_empty());
+            assert!(engine.recall_chunks(crate::chunks::ChunkRecallQuery {
+                text:"紫罗兰保险柜口令".into(),hit_memory_ids:vec![id.to_string()],
+                top_k:2,max_chars:2000,..Default::default()
+            }).await.unwrap().is_empty());
+            let trace = engine.memory_trace(id).await.unwrap().unwrap();
+            assert_eq!(trace["chunks"][0]["content"], original);
+            assert_eq!(trace["content"], "全家每周六清洁客厅");
             engine.shutdown();
         });
     }

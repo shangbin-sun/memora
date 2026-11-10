@@ -466,10 +466,15 @@ CREATE TABLE memory_chunk_links (
 CREATE INDEX idx_memory_chunk_links_chunk ON memory_chunk_links(chunk_id);
 "#;
 
+// Original excerpts remain available by fact ID, with no searchable index.
+const SCHEMA_V12: &str = r#"
+DROP TABLE IF EXISTS memory_chunk_fts;
+"#;
+
 pub const MIGRATION_SQL: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
-    SCHEMA_V11,
+    SCHEMA_V11, SCHEMA_V12,
 ];
 
 pub fn schema_version() -> usize { MIGRATION_SQL.len() }
