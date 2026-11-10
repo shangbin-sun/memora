@@ -27,6 +27,7 @@ mod forgetting;
 pub mod graph;
 mod household;
 mod long_extract;
+mod model_queue;
 mod performance;
 mod prompts;
 mod qianfan;

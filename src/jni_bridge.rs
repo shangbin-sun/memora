@@ -53,6 +53,32 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_schemaVersion(
     crate::store::schema_version() as jni::sys::jint
 }
 
+/// 无数据库的OCR请求入口，与所有启用serial_inference的引擎共享队列。
+#[no_mangle]
+pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_modelRequest(
+    mut env: JNIEnv, _class: JClass, body_json: JString,
+) -> jstring {
+    #[derive(Deserialize)]
+    struct Request {
+        url: String,
+        api_key: String,
+        request: serde_json::Value,
+        timeout_ms: u64,
+    }
+    let result = (|| -> Result<String, String> {
+        let raw = jstring_to_string(&mut env, body_json)?;
+        let body: Request = serde_json::from_str(&raw).map_err(|_| "invalid model request JSON".to_string())?;
+        runtime().block_on(crate::model_queue::request(
+            &body.url, &body.api_key, &body.request,
+            Duration::from_millis(body.timeout_ms.clamp(1, 600_000)),
+        )).map_err(|e| e.to_string())
+    })();
+    match result {
+        Ok(raw) => to_jstring(&mut env, raw),
+        Err(error) => { throw_runtime(&mut env, error); std::ptr::null_mut() }
+    }
+}
+
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -140,6 +166,8 @@ struct CreateOptions {
     llm_chat_api_key: Option<String>,
     llm_chat_url: Option<String>,
     llm_chat_model: Option<String>,
+    #[serde(default)]
+    serial_inference: bool,
 }
 
 fn qianfan_config(opts: &CreateOptions) -> Result<QianfanConfig, String> {
@@ -382,13 +410,13 @@ fn build_engine(opts: CreateOptions) -> Result<(MemoryEngine, Option<QianfanChat
             let cfg = qianfan_config(&opts)
                 .map_err(|e| format!("embedder={mode} needs an API key: {e}"))?;
             builder = builder.embedder(Arc::new(
-                QianfanEmbedder::new(cfg).map_err(|e| e.to_string())?,
+                QianfanEmbedder::new(cfg).map_err(|e| e.to_string())?.with_serial_requests(opts.serial_inference),
             ));
         }
         "auto" => {
             if let Ok(cfg) = qianfan_config(&opts) {
                 builder = builder.embedder(Arc::new(
-                    QianfanEmbedder::new(cfg).map_err(|e| e.to_string())?,
+                    QianfanEmbedder::new(cfg).map_err(|e| e.to_string())?.with_serial_requests(opts.serial_inference),
                 ));
             } else {
                 builder = builder.embedder(Arc::new(HashEmbedder::new(64)));
@@ -406,15 +434,15 @@ fn build_engine(opts: CreateOptions) -> Result<(MemoryEngine, Option<QianfanChat
         let archive = Config::default().consolidation_archive_importance;
         builder = builder
             .summarizer(Arc::new(
-                QianfanSummarizer::new(cfg.clone()).map_err(|e| e.to_string())?,
+                QianfanSummarizer::new(cfg.clone()).map_err(|e| e.to_string())?.with_serial_requests(opts.serial_inference),
             ))
             .classifier(Arc::new(
-                QianfanClassifier::new(cfg.clone(), archive).map_err(|e| e.to_string())?,
+                QianfanClassifier::new(cfg.clone(), archive).map_err(|e| e.to_string())?.with_serial_requests(opts.serial_inference),
             ))
             .graph_extractor(Arc::new(
-                QianfanGraphExtractor::new(cfg.clone()).map_err(|e| e.to_string())?,
+                QianfanGraphExtractor::new(cfg.clone()).map_err(|e| e.to_string())?.with_serial_requests(opts.serial_inference),
             ));
-        chat = Some(QianfanChat::new(cfg).map_err(|e| e.to_string())?);
+        chat = Some(QianfanChat::new(cfg).map_err(|e| e.to_string())?.with_serial_requests(opts.serial_inference));
     }
 
     let engine = runtime()

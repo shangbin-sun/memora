@@ -106,16 +106,24 @@ impl QianfanConfig {
 
 #[derive(Clone)]
 pub struct QianfanEmbedder {
+    serial_requests: bool,
     client: reqwest::Client,
     config: QianfanConfig,
     dim: std::sync::Arc<AtomicUsize>,
 }
 
 impl QianfanEmbedder {
+    /// 与其他启用串行的Memora模型客户端共用FIFO请求队列。
+    pub fn with_serial_requests(mut self, enabled: bool) -> Self {
+        self.serial_requests = enabled;
+        self
+    }
+
     pub fn new(config: QianfanConfig) -> Result<Self> {
         let dim = config.embed_dim;
         Ok(Self {
             client: build_llm_client(10, 45)?,
+            serial_requests: false,
             config,
             dim: std::sync::Arc::new(AtomicUsize::new(dim)),
         })
@@ -194,6 +202,7 @@ impl Embedder for QianfanEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        let _model_permit = crate::model_queue::acquire(self.serial_requests).await;
         let resp = self
             .client
             .post(&self.config.embed_url)
@@ -232,14 +241,22 @@ impl Embedder for QianfanEmbedder {
 
 #[derive(Clone)]
 pub struct QianfanSummarizer {
+    serial_requests: bool,
     client: reqwest::Client,
     config: QianfanConfig,
 }
 
 impl QianfanSummarizer {
+    /// 与其他启用串行的Memora模型客户端共用FIFO请求队列。
+    pub fn with_serial_requests(mut self, enabled: bool) -> Self {
+        self.serial_requests = enabled;
+        self
+    }
+
     pub fn new(config: QianfanConfig) -> Result<Self> {
         Ok(Self {
             client: build_llm_client(10, 60)?,
+            serial_requests: false,
             config,
         })
     }
@@ -355,17 +372,25 @@ enum ChatResponseMode {
 /// Thin chat client for host curators (extract / ops), same endpoint as summarizer.
 #[derive(Clone)]
 pub struct QianfanChat {
+    serial_requests: bool,
     client: reqwest::Client,
     config: QianfanConfig,
     permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl QianfanChat {
+    /// 与其他启用串行的Memora模型客户端共用FIFO请求队列。
+    pub fn with_serial_requests(mut self, enabled: bool) -> Self {
+        self.serial_requests = enabled;
+        self
+    }
+
     pub fn new(config: QianfanConfig) -> Result<Self> {
         Ok(Self {
             // Extraction explicitly receives a shared ten-minute deadline.
             // Short ordinary calls/ops still override this with their own budget.
             client: build_llm_client(10, EXTRACTION_TIMEOUT_SECS)?,
+            serial_requests: false,
             config,
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         })
@@ -499,6 +524,7 @@ impl QianfanChat {
             let api_key = api_key.clone();
             let body = body.clone();
             async move {
+                let _model_permit = crate::model_queue::acquire(self.serial_requests).await;
                 let resp = client
                     .post(&chat_url)
                     .timeout(request_timeout)
@@ -569,6 +595,7 @@ impl Summarizer for QianfanSummarizer {
         let prompt = format!(
             "请将下列记忆压缩为简洁中文摘要，保留关键事实与实体，不要编造。\n{entities}\n{joined}"
         );
+        let _model_permit = crate::model_queue::acquire(self.serial_requests).await;
         let resp = self
             .client
             .post(&self.config.chat_url)
@@ -606,15 +633,23 @@ impl Summarizer for QianfanSummarizer {
 
 #[derive(Clone)]
 pub struct QianfanClassifier {
+    serial_requests: bool,
     client: reqwest::Client,
     config: QianfanConfig,
     fallback: HeuristicClassifier,
 }
 
 impl QianfanClassifier {
+    /// 与其他启用串行的Memora模型客户端共用FIFO请求队列。
+    pub fn with_serial_requests(mut self, enabled: bool) -> Self {
+        self.serial_requests = enabled;
+        self
+    }
+
     pub fn new(config: QianfanConfig, archive_importance: f64) -> Result<Self> {
         Ok(Self {
             client: build_llm_client(10, 45)?,
+            serial_requests: false,
             config,
             fallback: HeuristicClassifier::new(archive_importance),
         })
@@ -670,6 +705,7 @@ impl MemoryClassifier for QianfanClassifier {
                 .unwrap_or("[]"),
             serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".into())
         );
+        let _model_permit = crate::model_queue::acquire(self.serial_requests).await;
         let resp = self
             .client
             .post(&self.config.chat_url)
@@ -718,6 +754,7 @@ impl MemoryClassifier for QianfanClassifier {
 /// LLM-only knowledge-graph extractor. Failures never become empty success.
 #[derive(Clone)]
 pub struct QianfanGraphExtractor {
+    serial_requests: bool,
     client: reqwest::Client,
     config: QianfanConfig,
     /// Shared by clones/callers; bound outbound requests, not just each document.
@@ -889,9 +926,16 @@ fn graph_error_allows_split(error: &MemoraError) -> bool {
 }
 
 impl QianfanGraphExtractor {
+    /// 与其他启用串行的Memora模型客户端共用FIFO请求队列。
+    pub fn with_serial_requests(mut self, enabled: bool) -> Self {
+        self.serial_requests = enabled;
+        self
+    }
+
     pub fn new(config: QianfanConfig) -> Result<Self> {
         Ok(Self {
             client: build_llm_client(10, EXTRACTION_TIMEOUT_SECS)?,
+            serial_requests: false,
             config,
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             limits: GraphExtractLimits::default(),
@@ -914,6 +958,7 @@ impl QianfanGraphExtractor {
             .await
             .map_err(|_| MemoraError::Other("kg request limiter closed".into()))?;
         budget.claim()?;
+        let _model_permit = crate::model_queue::acquire(self.serial_requests).await;
         let resp = self
             .client
             .post(&self.config.chat_url)
