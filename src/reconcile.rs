@@ -1182,11 +1182,11 @@ async fn apply_staged(
         .enumerate()
         .filter(|(_, fact)| fact.source_kind == "user_text")
         .collect();
-    for batch in conversational.chunks(RECONCILE_OPS_MAX_FACTS) {
+    for batch in conversational.chunks(if chat.edge_profile() { 1 } else { RECONCILE_OPS_MAX_FACTS }) {
         let candidates: Vec<_> = hits
             .iter()
             .filter(|hit| batch.iter().any(|(_, fact)| same_correction_bucket(hit, fact)))
-            .take(RECONCILE_OPS_MAX_HITS)
+            .take(if chat.edge_profile() { 2 } else { RECONCILE_OPS_MAX_HITS })
             .collect();
         if candidates.is_empty() {
             continue;
@@ -1198,7 +1198,7 @@ async fn apply_staged(
             bundle.ops_rules, facts_json, hits_json
         );
         if prompt.chars().count() + bundle.ops_system.chars().count()
-            > RECONCILE_OPS_MAX_PROMPT_CHARS
+            > if chat.edge_profile() { 2400 } else { RECONCILE_OPS_MAX_PROMPT_CHARS }
         {
             warnings.push(
                 "ops batch exceeds context budget; validated facts use deterministic write path"

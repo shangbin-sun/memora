@@ -15,6 +15,8 @@ pub trait Embedder: Send + Sync {
         format!("{}:{}", self.model_id(), self.dimension())
     }
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    async fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> { self.embed(texts).await }
+    fn hedge_queries(&self) -> bool { true }
 }
 
 #[derive(Debug, Clone)]

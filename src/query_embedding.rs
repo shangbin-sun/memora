@@ -349,9 +349,9 @@ impl Drop for BatchCleanup {
 const HEDGE_AFTER: Option<Duration> = if cfg!(test) { None } else { Some(Duration::from_millis(150)) };
 
 async fn hedged_embed(embedder: &Arc<dyn Embedder>, texts: &[String]) -> Option<Vec<Vector>> {
-    let first = embedder.embed(texts);
+    let first = embedder.embed_query(texts);
     tokio::pin!(first);
-    let Some(delay) = HEDGE_AFTER else {
+    let Some(delay) = HEDGE_AFTER.filter(|_| embedder.hedge_queries()) else {
         return first.await.ok();
     };
     tokio::select! {
@@ -359,7 +359,7 @@ async fn hedged_embed(embedder: &Arc<dyn Embedder>, texts: &[String]) -> Option<
         values = &mut first => return values.ok(),
         _ = tokio::time::sleep(delay) => {}
     }
-    let second = embedder.embed(texts);
+    let second = embedder.embed_query(texts);
     tokio::pin!(second);
     tokio::select! {
         values = &mut first => match values {

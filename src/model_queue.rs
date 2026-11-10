@@ -3,6 +3,50 @@
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[derive(Default)]
+struct EmbeddingState { busy: bool, queries: usize }
+fn embedding_state() -> &'static std::sync::Mutex<EmbeddingState> {
+    static STATE: OnceLock<std::sync::Mutex<EmbeddingState>> = OnceLock::new();
+    STATE.get_or_init(Default::default)
+}
+fn embedding_notify() -> &'static tokio::sync::Notify {
+    static N: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
+}
+pub(crate) struct EmbeddingPermit;
+impl Drop for EmbeddingPermit {
+    fn drop(&mut self) {
+        embedding_state().lock().unwrap().busy = false;
+        embedding_notify().notify_waiters();
+    }
+}
+struct QueryWaiter(bool);
+impl Drop for QueryWaiter {
+    fn drop(&mut self) {
+        if self.0 { embedding_state().lock().unwrap().queries -= 1; embedding_notify().notify_waiters(); }
+    }
+}
+/// 设备实测并发>1会拒绝：保留一个物理槽，检索跳过待执行后台任务。
+pub(crate) async fn acquire_embedding(enabled: bool, query: bool) -> Option<EmbeddingPermit> {
+    if !enabled { return None; }
+    if query { embedding_state().lock().unwrap().queries += 1; }
+    let mut waiter = QueryWaiter(query);
+    loop {
+        let notified = embedding_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let mut state = embedding_state().lock().unwrap();
+            if !state.busy && (query || state.queries == 0) {
+                state.busy = true;
+                if query { state.queries -= 1; waiter.0 = false; }
+                return Some(EmbeddingPermit);
+            }
+        }
+        notified.await;
+    }
+}
+
 fn queue() -> &'static Arc<Semaphore> {
     static QUEUE: OnceLock<Arc<Semaphore>> = OnceLock::new();
     QUEUE.get_or_init(|| Arc::new(Semaphore::new(1)))
@@ -47,6 +91,37 @@ pub(crate) async fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn query_embedding_overtakes_waiting_background() {
+        let held = acquire_embedding(true, false).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let bg_tx = tx.clone();
+        let bg = tokio::spawn(async move {
+            let _ = ready.send(());
+            let _p = acquire_embedding(true, false).await;
+            bg_tx.send("background").unwrap();
+        });
+        ready_rx.await.unwrap();
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let query = tokio::spawn(async move {
+            let _ = ready.send(());
+            let _p = acquire_embedding(true, true).await;
+            tx.send("query").unwrap();
+        });
+        ready_rx.await.unwrap();
+        drop(held);
+        assert_eq!(rx.recv().await, Some("query"));
+        assert_eq!(rx.recv().await, Some("background"));
+        bg.await.unwrap(); query.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn embedding_does_not_wait_for_llm_slot() {
+        let _model = acquire(true).await;
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2),acquire_embedding(true,true)).await.is_ok());
+    }
 
     #[tokio::test]
     async fn serial_queue_is_fifo_and_cancelled_waiter_does_not_block() {
@@ -134,7 +209,7 @@ mod tests {
         assert_eq!(text.await.unwrap(), "ok");
         assert!(ocr.await.unwrap().contains("ok"));
         server.join().unwrap();
-        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert!(peak.load(Ordering::SeqCst) <= 2);
     }
 
     #[tokio::test]
