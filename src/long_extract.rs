@@ -768,6 +768,13 @@ impl<'a, M: ExtractionModel> Run<'a, M> {
     ) -> Pin<Box<dyn Future<Output = Vec<StagedPart>> + Send + 'b>> {
         Box::pin(async move {
             let source = self.part_source(&node);
+            // A whitespace-only span has no facts; preserve coverage without
+            // asking a model to invent content for it.
+            if source.text.trim().is_empty() {
+                let mut part = self.empty_part(&node, None);
+                part.parsed.complete = !self.root.truncated;
+                return vec![part];
+            }
             let metadata = self.context_json(&node);
             let base_prompt = if self.model.edge_budget() { edge_extraction_prompt(&source, &self.context) } else { extraction_prompt(&source, &self.context, &metadata) };
             let mut salvage: Option<StagedPart> = None;
@@ -2097,6 +2104,15 @@ mod tests {
         .await;
         assert!(model.requests().is_empty());
         assert!(!staged.parts[0].parsed.complete);
+    }
+
+    #[tokio::test]
+    async fn whitespace_sources_never_call_a_model() {
+        let model = Script::default();
+        let root = source("  \n\t ");
+        let staged = stage_source_with_model(&model, root.clone(), ctx(), StageLimits::default()).await;
+        assert!(model.requests().is_empty());
+        assert!(valid_staged_source(&root, &staged));
     }
 
     #[test]
