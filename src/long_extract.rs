@@ -241,13 +241,7 @@ impl ExtractionModel for QianfanChat {
         .await
         .map(|mut completion| {
             if self.edge_profile() {
-                if let Ok(value) = serde_json::from_str::<Value>(&completion.text) {
-                    if let Some(rows) = value.get("records").and_then(Value::as_array) {
-                        let mut lines: Vec<String> = rows.iter().map(Value::to_string).collect();
-                        if value.get("done") == Some(&Value::Bool(true)) { lines.push(json!({"done":true}).to_string()); }
-                        completion.text = lines.join("\n");
-                    }
-                }
+                completion.text = edge_records_to_lines(&completion.text);
             }
             completion
         })
@@ -2129,4 +2123,32 @@ fn edge_extraction_prompt(source: &EvidenceSource, ctx: &ExtractContext) -> Stri
     ctx.speaker, json!(compact), ctx.tags, ctx.message_at_ms,
     ctx.transcript.chars().rev().take(120).collect::<String>().chars().rev().collect::<String>(),
     json!({"source_id":source.id,"kind":source.kind,"text":source.text}))
+}
+
+/// Typed envelope rejects duplicate records/done keys instead of silently
+/// discarding all but the last array. Invalid replies follow normal recovery.
+fn edge_records_to_lines(text: &str) -> String {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Envelope { records: Vec<Value>, done: bool }
+    match serde_json::from_str::<Envelope>(text) {
+        Ok(value) => {
+            let mut lines:Vec<String>=value.records.iter().map(Value::to_string).collect();
+            if value.done { lines.push(json!({"done":true}).to_string()); }
+            lines.join("\n")
+        }
+        Err(_) => text.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod edge_protocol_regressions {
+    use super::*;
+    #[test]
+    fn duplicate_envelopes_are_not_accepted_as_complete() {
+        let duplicate=r#"{"records":[{"o":"甲","t":"其他","c":"甲怕冷","e":"甲怕冷"}],"records":[],"done":true}"#;
+        assert!(!parse_extraction(&edge_records_to_lines(duplicate),"s","甲怕冷",false).complete);
+        let complete=r#"{"records":[{"o":"甲","t":"其他","c":"甲怕冷","e":"甲怕冷"}],"done":true}"#;
+        assert!(parse_extraction(&edge_records_to_lines(complete),"s","甲怕冷",false).complete);
+    }
 }

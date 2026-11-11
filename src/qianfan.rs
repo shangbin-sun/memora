@@ -195,7 +195,7 @@ impl Embedder for QianfanEmbedder {
             self.config.embed_url.trim(),
             self.config.embed_model,
             self.config.embed_dim
-        )
+        ) + if self.serial_requests { "|edge512-pool-v1" } else { "" }
     }
 
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> { self.embed_bounded(texts, false).await }
@@ -204,10 +204,28 @@ impl Embedder for QianfanEmbedder {
 }
 impl QianfanEmbedder {
     async fn embed_bounded(&self, texts: &[String], query: bool) -> Result<Vec<Vec<f32>>> {
-        let mut result = Vec::new();
-        let batch = if self.serial_requests { if query { 1 } else { 2 } } else { texts.len().max(1) };
-        for part in texts.chunks(batch) { result.extend(self.embed_part(part,query).await?); }
-        Ok(result)
+        if !self.serial_requests { return self.embed_part(texts,query).await; }
+        let mut outputs=Vec::new();
+        let mut parts=Vec::new();let mut ranges=Vec::new();
+        for text in texts {
+            let start=parts.len();
+            parts.extend(edge_embedding_parts(text));
+            ranges.push((start,parts.len()));
+        }
+        let mut vectors=Vec::new();
+        for batch in parts.chunks(if query {1}else{2}) {
+            vectors.extend(self.embed_part(batch,query).await?);
+        }
+        for (start,end) in ranges {
+            if end-start==1 { outputs.push(vectors[start].clone());continue; }
+            let mut pooled=vec![0.0;self.dimension()];
+            for i in start..end {
+                let weight=parts[i].chars().count().max(1) as f32;
+                for (value,component) in pooled.iter_mut().zip(&vectors[i]) { *value+=component*weight; }
+            }
+            outputs.push(crate::embedding::normalize_vector(pooled)?);
+        }
+        Ok(outputs)
     }
     async fn embed_part(&self, texts: &[String], query: bool) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
@@ -247,6 +265,20 @@ impl QianfanEmbedder {
         }
         Ok(vectors)
     }
+}
+
+/// Qwen NPU's largest bucket is 512 tokens and silently truncates longer input.
+/// At most 448 UTF-8 bytes plus a bounded query prefix/EOS fits byte-level BPE.
+/// Pool all pieces instead of losing the end of a fact/query.
+fn edge_embedding_parts(text: &str) -> Vec<String> {
+    let mut parts=Vec::new();let mut start=0;let mut bytes=0;
+    for (offset,ch) in text.char_indices() {
+        if bytes+ch.len_utf8()>448 {
+            parts.push(text[start..offset].to_owned());start=offset;bytes=0;
+        }
+        bytes+=ch.len_utf8();
+    }
+    parts.push(text[start..].to_owned());parts
 }
 
 #[derive(Clone)]
@@ -1997,4 +2029,18 @@ mod graph_budget_tests {
             .contains("too large"));
         assert_eq!(server.calls.load(Ordering::SeqCst), 0);
     }
+}
+
+#[cfg(test)]
+mod edge_embedding_regressions {
+ use super::*;
+ #[test]
+ fn embedding_chunks_preserve_unicode_and_tail() {
+  for text in ["".to_owned(), "a".repeat(1800), "家庭🙂".repeat(500)] {
+   let parts=edge_embedding_parts(&text);
+   assert_eq!(parts.concat(),text);
+   assert!(parts.iter().all(|p|p.len()<=448));
+   assert!(!parts.is_empty());
+  }
+ }
 }
