@@ -1,4 +1,4 @@
-//! 可配置的错题规则通道。事实正文保留原文，索引和会话只是元数据。
+//! 可配置的错题规则通道。正文紧凑展示，原文和题号保留在来源元数据。
 use crate::{core::now_ms, household, store, types::*, Result};
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -47,7 +47,7 @@ fn answer(text: &str) -> String {
     if text.contains("咬定青山不放松") {
         return "任尔东西南北风".into();
     }
-    Regex::new(r"答案[：:]\s*([^\n　（(]+)")
+    Regex::new(r"(?:正确答案|(?:^|[\s　])答案)[：:]\s*([^\n　（(]+)")
         .unwrap()
         .captures(text)
         .map(|c| {
@@ -61,6 +61,7 @@ fn answer(text: &str) -> String {
         .unwrap_or_default()
 }
 fn question(text: &str) -> String {
+    let text = text.split("孩子答案：").next().unwrap_or(text);
     let t = Regex::new(r"孩子选择[：:]\s*[A-D]\s*")
         .unwrap()
         .replace_all(text, "");
@@ -82,6 +83,37 @@ fn question(text: &str) -> String {
         .to_string()
 }
 // 同题重传允许题干的常见等价说法与批改痕迹不同，保留最新原文及上一版来源。
+fn child_answer(text: &str, heading: &str) -> String {
+    if let Some(c) = Regex::new(r"孩子(?:选择|答案)[：:][ \t]*([^\n　]*)").unwrap().captures(text) {
+        let value = c[1].split("正确答案").next().unwrap_or("").trim();
+        return if value.is_empty() { "没答上".into() } else { value.to_string() };
+    }
+    if let Some(c) = Regex::new(r"[（(]([√×])[）)]").unwrap().captures(text) {
+        return c[1].to_string();
+    }
+    // OCR批改痕迹邻近的选项/填空答案；空白不猜测错误答案。
+    if let Some(c) = Regex::new(r"(?m)([A-D])[.．、][^\n]*[×✗❌]").unwrap().captures(text) {
+        return c[1].to_string();
+    }
+    if has(text, &["东南西北"]) { return "任尔东南西北风".into(); }
+    let _ = heading;
+    "没答上".into()
+}
+fn compact_record(text: &str, correct: &str, child: &str) -> String {
+    let text = text.split("练习题面：").last().unwrap_or(text);
+    let text = Regex::new(r"^\s*\d+[.．、。]\s*").unwrap().replace(text, "");
+    let stem = question(&text);
+    let stem = Regex::new(r"_+").unwrap().replace_all(&stem, "（ ）");
+    let stem = stem.trim().trim_end_matches('*').trim();
+    let explanation = text.split("解析：").nth(1).unwrap_or("").trim();
+    let source = Regex::new(r"[（(]([^（）()]*《[^》]+》)[）)]").unwrap().captures(&text).map(|c|c[1].to_string()).unwrap_or_default();
+    let fallback = if source.is_empty() { "按题意核对正确答案。".to_string() } else { format!("{}。",source) };
+    let explanation = if explanation.is_empty() { &fallback } else { explanation };
+    let stem = Regex::new(r"\s*([ABCD][.．、])\s*").unwrap().replace_all(stem, "　$1 ");
+    // 选项横排，具体换行由UI按实际测量宽度处理。
+    let stem = stem.replace("　A.", "\nA.");
+    format!("{}\n**孩子答案：{}　正确答案：{}**　解析：{}", stem.trim(), child, correct, explanation)
+}
 fn question_key(text: &str) -> String {
     let stem = question(text).replace("每个小朋友分到几个苹果", "每人分到几个");
     let stem = Regex::new(r"^\s*\d+[.．、。]\s*(?:选择题[：:]\s*)?")
@@ -186,7 +218,21 @@ pub fn execute(
     let start = std::time::Instant::now();
     conn.execute_batch("CREATE TABLE IF NOT EXISTS wrong_practice_sessions(namespace TEXT NOT NULL,session_id TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(namespace,session_id)); CREATE TABLE IF NOT EXISTS wrong_practice_turns(namespace TEXT NOT NULL,session_id TEXT NOT NULL,message_id TEXT NOT NULL,reply TEXT NOT NULL,PRIMARY KEY(namespace,session_id,message_id));")?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut result = if body["action"] == "import" {
+    let mut result = if body["action"] == "family_seed" {
+        let mut seeded = crate::family_demo::seed(&tx, ns, jieba, &body)?;
+        if seeded["already_seeded"] != true {
+            if let Some(text) = body["wrong_questions"].as_str() {
+                let imported = import(&tx, ns, jieba, &json!({"text":text,"source_id":"preset:wrong_questions","name":"错题集.md","kind":"document"}))?;
+                if imported["handled"] != true || imported["error"].is_string() {
+                    return Err(crate::error::MemoraError::InvalidState("错题预设导入失败".into()));
+                }
+                seeded["wrong_questions"] = imported["count"].clone();
+            }
+        }
+        seeded
+    } else if body["action"] == "family_recall" {
+        crate::family_demo::recall(&tx, ns, &body)?
+    } else if body["action"] == "import" {
         import(&tx, ns, jieba, &body)?
     } else {
         turn(&tx, ns, jieba, &body)?
@@ -280,6 +326,9 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
                 raw_q
             );
         }
+        let a = answer(&q);
+        let child = child_answer(&q, heading);
+        q = compact_record(&q, &a, &child);
         if let Some(old) = existing.iter().find(|old| {
             old.number == number
                 && question_key(&old.raw) == question_key(&q)
@@ -295,7 +344,8 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
                 rec.metadata["original_text"] = json!(raw_q);
                 rec.metadata["source_name"] = body["name"].clone();
                 rec.metadata["image"] = json!(image);
-                rec.metadata["answer"] = json!(answer(&q));
+                rec.metadata["answer"] = json!(a);
+                rec.metadata["child_answer"] = json!(child);
                 rec.content = q.clone();
                 rec.updated_at_ms = now_ms();
                 store::update_memory(tx, &mut rec, jieba)?;
@@ -304,8 +354,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
             count += 1;
             continue;
         }
-        let a = answer(&q);
-        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":labels(&q,heading),"answer":a,"weight":1.0,"source_id":source,"latest_source_id":source,"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":raw_q,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
+        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":labels(&q,heading),"answer":a,"child_answer":child,"weight":1.0,"source_id":source,"latest_source_id":source,"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":raw_q,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
         let id = record(tx, ns, jieba, &owner, &q, meta, None)?;
         ids.push(id);
         count += 1;
