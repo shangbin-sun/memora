@@ -132,11 +132,11 @@ pub fn canonical_domain(raw: &str) -> Option<&'static str> {
         .find(|d| *d == t)
         .or_else(|| match t.as_str() {
             "医疗健康" | "医疗" | "健康" => Some("medical"),
-            "工作学习" | "工作" | "学习" | "教育" => Some("education"),
+            "工作学习" | "工作" | "学习" | "教育" | "职业" => Some("education"),
             "出行" => Some("travel"),
             "生活习惯" => Some("lifestyle"),
             "饮食" => Some("diet"),
-            "金融" => Some("finance"),
+            "金融" | "收入" | "消费" | "支出" => Some("finance"),
             "娱乐" | "社交" => Some("social"),
             "家务" | "家庭" => Some("household"),
             "其他" => Some("unknown"),

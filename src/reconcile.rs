@@ -391,6 +391,65 @@ fn tags_prompt(tags: &[crate::household::MemoryTag]) -> String {
     .unwrap_or_else(|_| "[]".into())
 }
 
+/// Only unambiguous commands in the user's own text bypass model interpretation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UserMemoryIntent {
+    Decline,
+    ForgetOwn(String),
+}
+
+pub(crate) fn user_memory_intent(text: &str) -> Option<UserMemoryIntent> {
+    let mut text=text.trim();
+    for _ in 0..3 {
+        if let Some(rest)=["请", "麻烦", "帮我"].iter().find_map(|prefix|text.strip_prefix(prefix)) {
+            text=rest.trim_start();
+        } else {break;}
+    }
+    let no_store=["不要记住这句话", "不要记录这句话", "不要保存这句话", "别记住这句话", "别记这句话", "这句话不要记住", "这段话不要记住"];
+    if no_store.iter().any(|prefix|text.starts_with(prefix))
+        && !["但请记住", "但要记住", "不过请记住", "只记住", "但请记录"].iter().any(|marker|text.contains(marker)) {
+        return Some(UserMemoryIntent::Decline);
+    }
+    let clean=text.trim_end_matches(|c:char|c.is_whitespace() || matches!(c,'。'|'！'|'!'|'？'|'?'|'.'));
+    let mut topic=["忘掉我", "忘记我", "删除我"].iter().find_map(|prefix|clean.strip_prefix(prefix))?.trim();
+    if topic.chars().any(|c|matches!(c,'，'|','|'；'|';'|'。'|'\n')) {return None;}
+    topic=topic.strip_suffix('吧').unwrap_or(topic).trim();
+    for suffix in ["这件事", "这个偏好", "这条记忆", "这一点", "这点"] {
+        if let Some(rest)=topic.strip_suffix(suffix) {topic=rest.trim();break;}
+    }
+    if !["喜欢", "爱", "讨厌", "习惯", "不喜欢", "不爱", "不喝", "不吃"].iter().any(|verb|topic.starts_with(verb))
+        || topic.contains("记住") || topic.contains("如果") || topic.chars().count()<3 {
+        return None;
+    }
+    Some(UserMemoryIntent::ForgetOwn(topic.to_owned()))
+}
+
+#[cfg(test)]
+mod user_intent_regressions {
+    use super::*;
+    #[test]
+    fn explicit_no_store_is_not_reduced_to_a_storeable_subclause() {
+        assert_eq!(user_memory_intent("不要记住这句话，我今天有点难过"),Some(UserMemoryIntent::Decline));
+        assert_eq!(user_memory_intent("请不要记录这句话，我今天难过"),Some(UserMemoryIntent::Decline));
+        assert!(user_memory_intent("“不要记住这句话”是一个例句").is_none());
+        assert!(user_memory_intent("不要记住这句话，但请记住明天开会").is_none());
+    }
+    #[test]
+    fn own_forgetting_is_narrow_and_preserves_its_topic() {
+        assert_eq!(user_memory_intent("忘掉我喜欢游泳这件事"),Some(UserMemoryIntent::ForgetOwn("喜欢游泳".into())));
+        assert_eq!(user_memory_intent("请帮我忘记我喜欢喝茶这个偏好吧"),Some(UserMemoryIntent::ForgetOwn("喜欢喝茶".into())));
+        assert!(user_memory_intent("忘掉我老婆喜欢日料这件事").is_none());
+        assert!(user_memory_intent("忘掉我喜欢游泳这件事，记住我喜欢跑步").is_none());
+        assert!(user_memory_intent("我忘记了明天几点开会").is_none());
+    }
+    #[test]
+    fn forgetting_never_matches_the_opposite_preference() {
+        assert!(retraction_matches("王明周末喜欢游泳","王明喜欢游泳"));
+        assert!(!retraction_matches("王明不喜欢游泳","王明喜欢游泳"));
+        assert!(!retraction_matches("王明喜欢游泳","王明不喜欢游泳"));
+    }
+}
+
 const RECONCILE_MAX_SOURCE_CHARS: usize = 120_000;
 /// Longer text alongside an attachment is treated as real content, not a caption.
 const ATTACHMENT_REMARK_CHARS: usize = 40;
@@ -796,11 +855,12 @@ async fn apply_staged(
     let turn_has_attachment = sources.iter().any(|source| source.kind != "user_text");
     for (root_source, staged_source) in sources.into_iter().zip(staged) {
         warnings.extend(staged_source.warnings);
+        let source_intent=if root_source.kind=="user_text" {user_memory_intent(&root_source.text)}else{None};
         for staged_part in staged_source.parts {
             let part = staged_part.source;
             let parsed = staged_part.parsed;
             extract_raw_last = staged_part.raw.or(extract_raw_last);
-            if part.preserve_original {
+            if part.preserve_original && !matches!(&source_intent,Some(UserMemoryIntent::Decline)) {
                 part_text.insert(part.id.clone(), part.text.clone());
             }
             let collect = |key: &str,
@@ -809,6 +869,10 @@ async fn apply_staged(
                            warnings: &mut Vec<String>,
                            seen: &mut HashSet<String>| {
                 for item in items {
+                    if matches!(&source_intent,Some(UserMemoryIntent::Decline))
+                        || (matches!(&source_intent,Some(UserMemoryIntent::ForgetOwn(_))) && key!="retractions") {
+                        continue;
+                    }
                     if !evidence_matches(item, &part.id, &part.text) {
                         warnings.push(format!("extract drop invalid provenance: {key}"));
                         continue;
@@ -852,6 +916,8 @@ async fn apply_staged(
                         json!([root_source.id, extracted_item_key(key, body, item)]).to_string(),
                     ) {
                         let mut accepted = item.clone();
+                        let label=item.get(if key=="register" {"display_name"}else{"owner"}).and_then(Value::as_str).unwrap_or("");
+                        accepted["_host_non_person_label"]=json!(root_source.kind!="user_text" && non_person_source_label(label,&root_source.text));
                         accepted["_host_graph_already_ingested"] =
                             json!(part.graph_already_ingested);
                         accepted["_host_source_id"] = json!(part.id);
@@ -928,6 +994,9 @@ async fn apply_staged(
             .unwrap_or_default();
         // A new alias must land on the person already known, never replace their aliases.
         let known = engine.list_members(ns).await?;
+        if item["_host_non_person_label"]==true && resolve_member_id(name,&known).is_none() {
+            warnings.push("extract drop non-person source field used as a new member".into());continue;
+        }
         let existing = known.iter().find(|m| {
             m.member_id == name || m.display_name == name || m.aliases.iter().any(|a| a == name)
         });
@@ -1011,7 +1080,7 @@ async fn apply_staged(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let tag = resolve_tag(item.get("tag").and_then(Value::as_str).unwrap_or(""), &tags);
+        let tag = resolve_tag(item.get("tag").and_then(Value::as_str).unwrap_or(""), &tags, content);
         let event = validated_event_date(item.get("event_at").and_then(Value::as_str));
         let llm_event_at = event.as_ref().map(|(date, _)| date.clone());
         let event_at_ms = event.map(|(_, ms)| ms);
@@ -1471,6 +1540,7 @@ fn validated_owner(item: &Value, members: &[HouseholdMember]) -> Option<String> 
         return None;
     }
     let owner = crate::household::canonical_owner_id(owner).ok()?;
+    if item["_host_non_person_label"]==true && resolve_member_id(&owner,members).is_none() {return None;}
     // An unknown explicit name may be registered; an ambiguous known alias may not.
     if !members.iter().any(|m| m.member_id == owner)
         && members.iter().filter(|m| m.display_name == owner || m.aliases.iter().any(|a| a == &owner)).count() > 1 {
@@ -1545,6 +1615,8 @@ fn same_correction_bucket(memory: &crate::types::MemoryRecord, fact: &Fact) -> b
 fn retraction_matches(stored: &str, topic: &str) -> bool {
     let stored = normalize_memory_text(stored);
     let topic = normalize_memory_text(topic);
+    if ["喜欢","习惯","爱"].iter().any(|verb|stored.contains(verb) && topic.contains(verb)
+        && stored.contains(&format!("不{verb}"))!=topic.contains(&format!("不{verb}"))) {return false;}
     stored == topic
         || (topic.chars().count() >= 4
             && (is_subsequence(&topic, &stored) || is_subsequence(&stored, &topic)))
@@ -1621,18 +1693,17 @@ fn resolve_member_id(token: &str, members: &[HouseholdMember]) -> Option<String>
     (matches.len() == 1).then(|| matches[0].member_id.clone())
 }
 
-fn resolve_tag(raw: &str, tags: &[crate::household::MemoryTag]) -> String {
-    let raw = raw.trim();
-    if let Some(t) = tags
-        .iter()
-        .find(|t| t.tag_id == raw || t.display_name == raw || t.aliases.iter().any(|a| a == raw))
-    {
-        return t.tag_id.clone();
+fn resolve_tag(raw: &str, tags: &[crate::household::MemoryTag], content: &str) -> String {
+    // Keep exact catalog labels/custom tags before legacy domain conversion.
+    let canonical = crate::household::resolve_tag_id(tags, raw);
+    if let Some(tag) = tags.iter().find(|tag| tag.tag_id == canonical) {
+        return tag.tag_id.clone();
     }
-    tags.iter()
-        .find(|tag| tag.tag_id == "其他")
-        .map(|tag| tag.tag_id.clone())
-        .unwrap_or_default()
+    // A model category outside the catalog is not an implicit new tag.
+    let inferred = crate::household::infer_tag_from_text(content, &[]);
+    tags.iter().find(|tag| tag.tag_id == inferred)
+        .or_else(|| tags.iter().find(|tag| tag.tag_id == "其他"))
+        .map(|tag| tag.tag_id.clone()).unwrap_or_default()
 }
 /// Persist only structural reference locations. Generated summaries and full
 /// cited paragraphs remain ephemeral to avoid widening each memory's ACL.
@@ -2469,5 +2540,88 @@ mod birth_precision_tests {
         }
         assert_eq!(preserve_birth_precision("生日是4月18日","出生于1991年4月17日"),"生日是4月18日");
         assert_eq!(preserve_birth_precision("复诊日是4月17日","出生于1991年4月17日"),"复诊日是4月17日");
+    }
+}
+
+#[cfg(test)]
+mod extraction_tag_regressions {
+    use super::*;
+    fn catalog() -> Vec<crate::household::MemoryTag> {
+        crate::household::DEFAULT_TAGS.iter().map(|(id, aliases)|crate::household::MemoryTag {
+            tag_id:(*id).into(),display_name:(*id).into(),aliases:aliases.iter().map(|a|(*a).into()).collect()
+        }).collect()
+    }
+    #[test]
+    fn extracted_categories_use_existing_domain_mapping_and_content_fallback() {
+        let tags=catalog();
+        assert_eq!(resolve_tag("教育",&tags,"就读四年级"),"工作学习");
+        assert_eq!(resolve_tag("职业",&tags,"软件工程师"),"工作学习");
+        assert_eq!(resolve_tag("收入",&tags,"每月税后7000元"),"金融");
+        assert_eq!(resolve_tag("消费",&tags,"食品花费90元"),"金融");
+        assert_eq!(resolve_tag("未定义标签",&tags,"每月工资7000元"),"金融");
+        assert_eq!(resolve_tag("未定义标签",&tags,"喜欢喝茶"),"饮食");
+        assert_eq!(resolve_tag("未定义标签",&tags,"出生于三月"),"其他");
+    }
+    #[test]
+    fn explicit_custom_labels_and_valid_model_tags_keep_priority() {
+        let mut tags=catalog();
+        tags.push(crate::household::MemoryTag{tag_id:"收入".into(),display_name:"我的账本".into(),aliases:vec!["收支分类".into()]});
+        assert_eq!(resolve_tag("收入",&tags,"每月工资7000元"),"收入");
+        assert_eq!(resolve_tag("收支分类",&tags,"每月工资7000元"),"收入");
+        assert_eq!(resolve_tag("医疗健康",&tags,"去医院后旅游"),"医疗健康");
+        assert_eq!(resolve_tag("其他",&tags,"学过数学"),"其他");
+    }
+    #[test]
+    fn domain_conversion_never_creates_a_tag_missing_from_catalog() {
+        let tags=vec![crate::household::MemoryTag{tag_id:"其他".into(),display_name:"其他".into(),aliases:vec![]}];
+        assert_eq!(resolve_tag("收入",&tags,"每月税后7000元"),"其他");
+    }
+}
+
+fn non_person_source_label(label: &str, text: &str) -> bool {
+    if label.is_empty() {return false;}
+    let non_person=["分类","类别","费用类别","项目","商户","店名","开票单位","学校","医院","地点","地址","金额","出生日期","日期","发票号","编号","单号","票号","ID","主键"];
+    // An explicit person-name field wins over a coincidentally unusual name.
+    for line in text.lines() {
+        if let Some((key,value))=line.split_once('：').or_else(||line.split_once(':')) {
+            if ["姓名","患者","学生","人物"].contains(&key.trim()) && value.trim()==label {return false;}
+        }
+    }
+    let record_id=label.chars().any(|c|c.is_ascii_alphabetic()) && label.chars().any(|c|c.is_ascii_digit())
+        && label.chars().all(|c|c.is_ascii_alphanumeric() || matches!(c,'-'|'_'));
+    let mut headers:Vec<&str>=Vec::new();let mut previous:Vec<&str>=Vec::new();
+    for line in text.lines() {
+        let line=line.trim();
+        if let Some((key,value))=line.split_once('：').or_else(||line.split_once(':')) {
+            if non_person.contains(&key.trim()) && value.trim()==label {return true;}
+        }
+        if !line.starts_with('|') {headers.clear();previous.clear();continue;}
+        let cells:Vec<&str>=line.trim_matches('|').split('|').map(str::trim).collect();
+        if cells.len()>1 && cells.iter().all(|c|!c.is_empty() && c.chars().all(|v|matches!(v,'-'|':'|' '))) {headers=previous.clone();continue;}
+        if headers.len()==cells.len() {
+            for (header,value) in headers.iter().zip(&cells) {
+                let typed=non_person.contains(header) || header.starts_with("金额")
+                    || (record_id && (header.contains("ID") || header.contains("编号") || header.contains("主键")));
+                if typed && value.split("<br>").any(|token|token.trim()==label) {return true;}
+            }
+        }
+        previous=cells;
+    }
+    false
+}
+#[cfg(test)]
+mod document_owner_type_regressions {
+    use super::*;
+    #[test]
+    fn business_ids_categories_and_named_fields_are_not_implicit_people() {
+        let doc="| ID与持有人 | 金额 元 |\n| --- | --- |\n| ASSET102<br>爸爸 | 900 |\n";
+        assert!(non_person_source_label("ASSET102",doc));
+        assert!(!non_person_source_label("爸爸",doc));
+        assert!(non_person_source_label("城市通勤","| 分类 | 金额 |\n| --- | --- |\n| 城市通勤 | 80 |"));
+        assert!(non_person_source_label("山河超市","商户：山河超市"));
+        assert!(!non_person_source_label("城市通勤","姓名：城市通勤\n商户：城市通勤"));
+        assert!(validated_owner(&json!({"owner":"ASSET102","subjects":["ASSET102"],"_host_non_person_label":true}),&[]).is_none());
+        let member=HouseholdMember{member_id:"ASSET102".into(),display_name:"王明".into(),role:MemberRole::Other,aliases:vec![],age_band:None};
+        assert_eq!(validated_owner(&json!({"owner":"ASSET102","subjects":["ASSET102"],"_host_non_person_label":true}),&[member]),Some("ASSET102".into()));
     }
 }

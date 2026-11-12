@@ -27,6 +27,7 @@ mod forgetting;
 pub mod graph;
 mod household;
 mod long_extract;
+mod edge_table;
 mod model_queue;
 mod performance;
 mod prompts;
