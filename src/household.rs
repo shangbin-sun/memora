@@ -609,9 +609,9 @@ pub fn resolve_tag_id(catalog: &[MemoryTag], raw: &str) -> String {
 /// Validate explicit metadata against the tag catalog (including built-ins).
 /// Unknown model-produced strings must not become new tags implicitly.
 pub fn validated_metadata_tag(catalog: &[MemoryTag], metadata: &Value) -> Option<String> {
-    if let Some(raw) = metadata.get("tag").and_then(Value::as_str).map(str::trim) {
+    if let Some(raw) = metadata.get("tag").and_then(Value::as_str).map(str::trim).filter(|v| *v != "错题集") {
         if let Some(tag) = catalog.iter().find(|tag| {
-            tag.tag_id == raw || tag.display_name == raw || tag.aliases.iter().any(|a| a == raw)
+            tag.tag_id != "错题集" && (tag.tag_id == raw || tag.display_name == raw || tag.aliases.iter().any(|a| a == raw))
         }) {
             return Some(tag.tag_id.clone());
         }

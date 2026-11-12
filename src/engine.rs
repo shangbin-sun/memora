@@ -579,7 +579,7 @@ impl MemoryEngine {
         let Some(rec) = rec else {
             return Ok(());
         };
-        if rec.state != MemoryState::Active || !rec.embedding_pending {
+        if rec.tag == "错题集" || rec.state != MemoryState::Active || !rec.embedding_pending {
             return Ok(());
         }
         let text = rec.summary.clone().unwrap_or_else(|| rec.content.clone());
@@ -2145,6 +2145,21 @@ impl MemoryEngine {
     /// graph extraction. The job is processed by `retry_graph_projections` / tick.
     /// Compatibility alias for ordinary `remember`, which also defers graph
     /// extraction. `skip_graph` still disables projection altogether.
+    /// 专用规则通道：同库事务保存题目、会话和作答；不经过任何模型。
+    pub async fn wrong_practice(&self, body: serde_json::Value) -> Result<serde_json::Value> {
+        let _mutation = self.inner.mutation_lock.lock().await;
+        self.ensure_open()?;
+        let pool = self.inner.pool.clone();
+        let ns = self.inner.namespace.clone();
+        let jieba = self.inner.jieba.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get()?;
+            crate::wrong_practice::execute(&mut conn, &ns, jieba.as_ref(), body)
+        }).await??;
+        self.invalidate_memories(&[]).await;
+        Ok(result)
+    }
+
     pub async fn remember_deferred_graph(&self, input: RememberInput) -> Result<MemoryId> {
         self.remember_with_graph_projection(input).await
     }
@@ -3570,6 +3585,8 @@ fn graph_matches_query(
 }
 
 fn recall_matches(rec: &MemoryRecord, query: &RecallQuery, namespace: &str) -> bool {
+    if rec.tag == "错题集" { return false; }
+
     crate::store::memory_is_recallable(rec)
         && rec.namespace == namespace
         && (query.kinds.is_empty() || query.kinds.contains(&rec.kind))

@@ -1878,3 +1878,20 @@ mod contract_tests {
         assert_eq!(meta["custom"], 1);
     }
 }
+
+/// 规则错题通道，与普通抽取入口隔离。
+#[no_mangle]
+pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_wrongPractice(
+    mut env: JNIEnv, _class: JClass, handle: jlong, body_json: JString,
+) -> jstring {
+    let result = (|| -> std::result::Result<serde_json::Value, String> {
+        let raw = jstring_to_string(&mut env, body_json)?;
+        let body = serde_json::from_str(&raw).map_err(|e| format!("practice json: {e}"))?;
+        let engine = engine_of(handle)?;
+        runtime().block_on(engine.wrong_practice(body)).map_err(|e| e.to_string())
+    })();
+    match result {
+        Ok(value) => to_jstring(&mut env, value.to_string()),
+        Err(error) => { throw_runtime(&mut env, error); std::ptr::null_mut() }
+    }
+}

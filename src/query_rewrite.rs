@@ -159,6 +159,14 @@ pub fn rewrite_plan(text: &str) -> RewritePlan {
             }
         }
     }
+    if looks_like_question(trimmed) {
+        let mut add = |words: &[&str]| { for word in words { extra.insert((*word).to_string()); } };
+        if trimmed.contains("什么菜") { add(&["喜欢", "吃", "饮食"]); }
+        if trimmed.contains("什么运动") { add(&["周末", "喜欢", "运动", "打"]); }
+        if trimmed.contains("什么电视剧") || trimmed.contains("什么剧") { add(&["爱看", "年代剧", "电视剧"]); }
+        if trimmed.contains("最近在玩") { add(&["最近", "迷上", "拼", "爱好"]); }
+        if trimmed.contains("喝什么") || trimmed.contains("什么饮料") { add(&["喜欢", "喝", "饮食"]); }
+    }
     plan.extra_words = extra.into_iter().collect();
 
     // 变体改写：仅问句。

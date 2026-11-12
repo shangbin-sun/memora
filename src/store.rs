@@ -1139,7 +1139,7 @@ pub fn prepare_vector_space(
             AND m.state = 'active' AND m.embedding_version = embeddings.version AND m.embedding_pending = 0)",
         params![space, dim as i64, model])?;
     tx.execute("UPDATE memories SET embedding_pending = 1, embedding_model = ?1
-        WHERE state = 'active' AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.memory_id = memories.id)", params![model])?;
+        WHERE state = 'active' AND tag != '错题集' AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.memory_id = memories.id)", params![model])?;
     tx.commit()?;
     Ok(())
 }
@@ -1503,7 +1503,7 @@ pub fn touch_memories(conn: &Connection, ids: &[MemoryId], now: i64) -> Result<(
 
 pub fn pending_embedding_ids(conn: &Connection) -> Result<Vec<MemoryId>> {
     let mut stmt =
-        conn.prepare("SELECT id FROM memories WHERE embedding_pending = 1 AND state = 'active'")?;
+        conn.prepare("SELECT id FROM memories WHERE embedding_pending = 1 AND state = 'active' AND tag != '错题集'")?;
     let rows = stmt.query_map([], |r| {
         Ok(Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()))
     })?;

@@ -636,6 +636,9 @@ pub async fn prepare_reconcile(
         }));
     }
     let members = engine.list_members(req.namespace.as_deref()).await?;
+    if let Some(report) = crate::simple_preferences::remember(engine, &req, &members, &sources).await? {
+        return Ok(ReconcileOutcome::Complete(report));
+    }
     let tags = engine.list_tags(req.namespace.as_deref()).await?;
     // Freeze time and explicit speaker across continuations; never infer the
     // speaker from the UI default or a chunk's topic summary.
