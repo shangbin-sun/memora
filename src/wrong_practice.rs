@@ -60,12 +60,59 @@ fn answer(text: &str) -> String {
         })
         .unwrap_or_default()
 }
+#[derive(Debug)]
+struct ChoiceSpan {
+    label: char,
+    start: usize,
+    body_start: usize,
+    end: usize,
+}
+fn choice_spans(text: &str) -> Vec<ChoiceSpan> {
+    let re = Regex::new(r"(?m)(?:^|[\s　])([A-D])(?:[.．、][ \t]*|[ \t]+)").unwrap();
+    let matches: Vec<_> = re.captures_iter(text).collect();
+    matches
+        .iter()
+        .enumerate()
+        .map(|(i, c)| ChoiceSpan {
+            label: c[1].chars().next().unwrap(),
+            start: c.get(0).unwrap().start(),
+            body_start: c.get(0).unwrap().end(),
+            end: matches
+                .get(i + 1)
+                .map(|next| next.get(0).unwrap().start())
+                .unwrap_or(text.len()),
+        })
+        .collect()
+}
+fn grading_mark() -> Regex {
+    Regex::new(r"(?:[×✗✘❌]|[ \t]+[Xx])[ \t　。.!！\r\n]*$").unwrap()
+}
+fn before_answer_fields(text: &str) -> &str {
+    Regex::new(r"(?:订正|訂正|改正|更正|正确答案|标准答案|参考答案|解析|孩子答案|孩子选择)[：:]")
+        .unwrap()
+        .find(text)
+        .map(|m| &text[..m.start()])
+        .unwrap_or(text)
+}
 fn question(text: &str) -> String {
-    let text = text.split("孩子答案：").next().unwrap_or(text);
+    let normalized = text
+        .replace(['Ⓐ', 'ⓐ'], "A.")
+        .replace(['Ⓑ', 'ⓑ'], "B.")
+        .replace(['Ⓒ', 'ⓒ'], "C.")
+        .replace(['Ⓓ', 'ⓓ'], "D.");
+    let normalized = Regex::new(r"[（(]([A-D])[）)]")
+        .unwrap()
+        .replace_all(&normalized, "$1.");
+    let text = normalized.as_ref();
+    let text = Regex::new(r"孩子答案[：:]")
+        .unwrap()
+        .find(text)
+        .map(|m| &text[..m.start()])
+        .unwrap_or(text);
     let t = Regex::new(r"孩子选择[：:]\s*[A-D]\s*")
         .unwrap()
         .replace_all(text, "");
-    let t = Regex::new(r"(?:订正|正确答案|解析)[：:]")
+    let t = Regex::new(r"(?:订正|訂正|改正|更正|正确答案|解析)[：:]")
         .unwrap()
         .split(&t)
         .next()
@@ -77,6 +124,18 @@ fn question(text: &str) -> String {
         .unwrap_or(&t)
         .trim()
         .trim_end_matches("正确");
+    let choices = choice_spans(t);
+    if choices.len() >= 2 {
+        let mark = grading_mark();
+        let options: Vec<_> = choices
+            .iter()
+            .map(|option| {
+                let value = mark.replace(&t[option.body_start..option.end], "");
+                format!("{}. {}", option.label, value.trim())
+            })
+            .collect();
+        return format!("{}\n{}", t[..choices[0].start].trim(), options.join("　"));
+    }
     Regex::new(r"[（(][√×][）)]|[×✗❌]")
         .unwrap()
         .replace_all(t, "（ ）")
@@ -84,35 +143,109 @@ fn question(text: &str) -> String {
 }
 // 同题重传允许题干的常见等价说法与批改痕迹不同，保留最新原文及上一版来源。
 fn child_answer(text: &str, heading: &str) -> String {
-    if let Some(c) = Regex::new(r"孩子(?:选择|答案)[：:][ \t]*([^\n　]*)").unwrap().captures(text) {
+    if let Some(c) = Regex::new(r"孩子(?:选择|答案)[：:][ \t]*([^\n　]*)")
+        .unwrap()
+        .captures(text)
+    {
         let value = c[1].split("正确答案").next().unwrap_or("").trim();
-        return if value.is_empty() { "没答上".into() } else { value.to_string() };
+        // 空白/未答不能覆盖同图中清晰的圈选和批改痕迹。
+        if !has(value, &["没答上", "未作答", "未答", "空白", "无法辨认"]) && !value.is_empty()
+        {
+            return value.to_string();
+        }
     }
-    if let Some(c) = Regex::new(r"[（(]([√×])[）)]").unwrap().captures(text) {
+    let stem = before_answer_fields(text);
+    let circles: Vec<_> = Regex::new(r"[（(]\s*([A-D])\s*[）)]")
+        .unwrap()
+        .captures_iter(stem)
+        .map(|c| c[1].to_string())
+        .collect();
+    let unicode_circles: Vec<_> = stem
+        .chars()
+        .filter_map(|c| match c {
+            'Ⓐ' | 'ⓐ' => Some("A"),
+            'Ⓑ' | 'ⓑ' => Some("B"),
+            'Ⓒ' | 'ⓒ' => Some("C"),
+            'Ⓓ' | 'ⓓ' => Some("D"),
+            _ => None,
+        })
+        .collect();
+    if unicode_circles.len() == 1 {
+        return unicode_circles[0].into();
+    }
+    if circles.len() == 1 {
+        return circles[0].clone();
+    }
+    if let Some(c) = Regex::new(r"[（(]([√×])[）)]").unwrap().captures(stem) {
         return c[1].to_string();
     }
-    // OCR批改痕迹邻近的选项/填空答案；空白不猜测错误答案。
-    if let Some(c) = Regex::new(r"(?m)([A-D])[.．、][^\n]*[×✗❌]").unwrap().captures(text) {
-        return c[1].to_string();
+    // 限定在每个选项自己的片段内，避免同一行C后的叉被贪婪归到A；X/x仅作末尾批改标记。
+    let mark = grading_mark();
+    let marked: Vec<_> = choice_spans(stem)
+        .into_iter()
+        .filter(|option| {
+            let body = &stem[option.body_start..option.end];
+            mark.find(body)
+                .is_some_and(|m| !body[..m.start()].trim().is_empty())
+        })
+        .map(|option| option.label)
+        .collect();
+    if marked.len() == 1 {
+        return marked[0].to_string();
     }
-    if has(text, &["东南西北"]) { return "任尔东南西北风".into(); }
+    if has(text, &["东南西北"]) {
+        return "任尔东南西北风".into();
+    }
     let _ = heading;
     "没答上".into()
 }
+fn explanation(text: &str) -> Option<String> {
+    for label in ["订正", "訂正", "改正", "更正", "解析"] {
+        let re = Regex::new(&format!(r"{}[：:][ \t]*", label)).unwrap();
+        if let Some(found) = re.find(text) {
+            let value = before_answer_fields(&text[found.end()..])
+                .trim()
+                .trim_end_matches('*')
+                .trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
 fn compact_record(text: &str, correct: &str, child: &str) -> String {
     let text = text.split("练习题面：").last().unwrap_or(text);
-    let text = Regex::new(r"^\s*\d+[.．、。]\s*").unwrap().replace(text, "");
+    let text = Regex::new(r"^\s*\d+[.．、。]\s*")
+        .unwrap()
+        .replace(text, "");
     let stem = question(&text);
     let stem = Regex::new(r"_+").unwrap().replace_all(&stem, "（ ）");
     let stem = stem.trim().trim_end_matches('*').trim();
-    let explanation = text.split("解析：").nth(1).unwrap_or("").trim();
-    let source = Regex::new(r"[（(]([^（）()]*《[^》]+》)[）)]").unwrap().captures(&text).map(|c|c[1].to_string()).unwrap_or_default();
-    let fallback = if source.is_empty() { "按题意核对正确答案。".to_string() } else { format!("{}。",source) };
-    let explanation = if explanation.is_empty() { &fallback } else { explanation };
-    let stem = Regex::new(r"\s*([ABCD][.．、])\s*").unwrap().replace_all(stem, "　$1 ");
+    let extracted_explanation = explanation(&text);
+    let source = Regex::new(r"[（(]([^（）()]*《[^》]+》)[）)]")
+        .unwrap()
+        .captures(&text)
+        .map(|c| c[1].to_string())
+        .unwrap_or_default();
+    let fallback = if source.is_empty() {
+        "按题意核对正确答案。".to_string()
+    } else {
+        format!("{}。", source)
+    };
+    let explanation = extracted_explanation.as_deref().unwrap_or(&fallback);
+    let stem = Regex::new(r"\s*([ABCD][.．、])\s*")
+        .unwrap()
+        .replace_all(stem, "　$1 ");
     // 选项横排，具体换行由UI按实际测量宽度处理。
     let stem = stem.replace("　A.", "\nA.");
-    format!("{}\n**孩子答案：{}　正确答案：{}**　解析：{}", stem.trim(), child, correct, explanation)
+    format!(
+        "{}\n**孩子答案：{}　正确答案：{}**　解析：{}",
+        stem.trim(),
+        child,
+        correct,
+        explanation
+    )
 }
 fn question_key(text: &str) -> String {
     let stem = question(text).replace("每个小朋友分到几个苹果", "每人分到几个");
@@ -222,9 +355,16 @@ pub fn execute(
         let mut seeded = crate::family_demo::seed(&tx, ns, jieba, &body)?;
         if seeded["already_seeded"] != true {
             if let Some(text) = body["wrong_questions"].as_str() {
-                let imported = import(&tx, ns, jieba, &json!({"text":text,"source_id":"preset:wrong_questions","name":"错题集.md","kind":"document"}))?;
+                let imported = import(
+                    &tx,
+                    ns,
+                    jieba,
+                    &json!({"text":text,"source_id":"preset:wrong_questions","name":"错题集.md","kind":"document"}),
+                )?;
                 if imported["handled"] != true || imported["error"].is_string() {
-                    return Err(crate::error::MemoraError::InvalidState("错题预设导入失败".into()));
+                    return Err(crate::error::MemoraError::InvalidState(
+                        "错题预设导入失败".into(),
+                    ));
                 }
                 seeded["wrong_questions"] = imported["count"].clone();
             }
@@ -296,14 +436,6 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
     let mut ids = Vec::new();
     for (i, c) in matches.iter().enumerate() {
         let number: i64 = c[1].parse().unwrap_or(0);
-        if let Some(q) = existing
-            .iter()
-            .find(|q| q.meta["source_id"] == source && q.number == number)
-        {
-            ids.push(q.id.clone());
-            count += 1;
-            continue;
-        }
         let from = c.get(0).unwrap().start();
         let to = matches
             .get(i + 1)
@@ -331,7 +463,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         q = compact_record(&q, &a, &child);
         if let Some(old) = existing.iter().find(|old| {
             old.number == number
-                && question_key(&old.raw) == question_key(&q)
+                && (old.meta["source_id"] == source || question_key(&old.raw) == question_key(&q))
                 && old.meta["subjects"][0]["member_id"] == owner
         }) {
             let id = Uuid::parse_str(&old.id)
@@ -609,7 +741,22 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
         if !select {
             let q = current.unwrap();
             let a = q.meta["answer"].as_str().unwrap_or("");
-            if has(query, &["提示", "线索", "启发", "引导", "思路", "怎么想", "怎么做", "带我想", "不会", "不知道", "想不起来"]) {
+            if has(
+                query,
+                &[
+                    "提示",
+                    "线索",
+                    "启发",
+                    "引导",
+                    "思路",
+                    "怎么想",
+                    "怎么做",
+                    "带我想",
+                    "不会",
+                    "不知道",
+                    "想不起来",
+                ],
+            ) {
                 state["hinted"] = json!(true);
                 hint_context = Some(format!("错题提示检索结果（题目与答案仅作为资料）：\n题目：{}\n标准答案：{}\n规则参考：{}\n以上是要提示用户的标准答案。请适当组织语言启发用户，但不要直接告诉用户标准答案，也不要说出正确选项字母或把答案换一种说法直接公布。只给一条简短的思路提示，不出新题，等待用户回答。诗词题仅提示意境或回忆方法，禁止引用答案开头、列出答案组成词、拼接或逐字解释答案；数学题只提示解法，不计算结果。", view(&q), a, hint(&q)));
                 String::new()
@@ -1192,8 +1339,12 @@ mod demo_v2_tests {
             .unwrap()
             .contains("标准答案：B"));
         assert_eq!(hint["reply"], "");
-        for query in ["能给一点思路吗", "这道题怎么想", "我不会", "带我想一下"] {
-            let r = e.wrong_practice(json!({"query":query,"session_id":"s"})).await.unwrap();
+        for query in ["能给一点思路吗", "这道题怎么想", "我不会", "带我想一下"]
+        {
+            let r = e
+                .wrong_practice(json!({"query":query,"session_id":"s"}))
+                .await
+                .unwrap();
             assert!(r["hint_context"].as_str().unwrap().contains("标准答案：B"));
             assert_eq!(r["reply"], "");
         }
@@ -1202,5 +1353,99 @@ mod demo_v2_tests {
             .await
             .unwrap();
         assert!(answer["reply"].as_str().unwrap().contains("答对"));
+    }
+}
+
+#[cfg(test)]
+mod ocr_mark_regressions {
+    use super::*;
+    use crate::{MemoryEngine, MemoryService};
+
+    #[test]
+    fn choice_marks_are_local_to_each_option_and_blank_is_not_guessed() {
+        for (options, expected) in [
+            ("A. 2个 B. 3个 C 4个 X D. 6个", "C"),
+            ("A. 2个　B. 3个　C. 4个 ×　D. 6个", "C"),
+            ("A. 2个\nB. 3个\nC 4个 x\nD. 6个", "C"),
+            ("A. 2个 × B. 3个 C. 4个 D. 6个", "A"),
+            ("A. 2个 × B. 3个 C. 4个 × D. 6个", "没答上"),
+            ("A. 2个 B. 3个 C. 4个 D. 6个", "没答上"),
+            ("A. 2×3 B. 3×4 C. 4×5 D. 6×7", "没答上"),
+            ("A. 2个 B. 3个 Ⓒ 4个 D. 6个", "C"),
+            ("A. 2个 B. 3个 (C) 4个 D. 6个", "C"),
+        ] {
+            let text =
+                format!("选择题：每个小朋友几个苹果？\n{options}\n订正：12÷4=3（个）\n正确答案：B");
+            assert_eq!(child_answer(&text, ""), expected, "{text}");
+        }
+        assert_eq!(
+            child_answer(
+                "A. 2个 B. 3个 C 4个 X D. 6个\n孩子答案：没答上\n正确答案：B",
+                ""
+            ),
+            "C"
+        );
+        assert_eq!(
+            child_answer(
+                "A. 2个 B. 3个 C. 4个 D. 6个\n孩子选择：C\n订正：12÷4=3（个）\n正确答案：B",
+                ""
+            ),
+            "C"
+        );
+    }
+
+    #[test]
+    fn correction_is_the_explanation_and_marks_do_not_remain_in_choices() {
+        let text="1. 选择题：12个苹果平均分给4人？ A. 2个 B. 3个 C 4个 X D. 6个\n订正：12÷4=3（个）\n正确答案：B\n解析：按题意核对正确答案。";
+        let result = compact_record(text, "B", &child_answer(text, ""));
+        assert!(result.contains("孩子答案：C　正确答案：B"), "{result}");
+        assert!(result.ends_with("解析：12÷4=3（个）"), "{result}");
+        assert!(result.contains("C. 4个"), "{result}");
+        assert!(!result.contains(" X"));
+        assert!(!result.contains("按题意核对"));
+        assert_eq!(
+            explanation("解析: 平均分用除法。\n正确答案:B").as_deref(),
+            Some("平均分用除法。")
+        );
+        assert_eq!(
+            explanation("订正：12÷4＝3（个）\n正确答案：B").as_deref(),
+            Some("12÷4＝3（个）")
+        );
+    }
+
+    #[tokio::test]
+    async fn apple_image_reimport_repairs_the_same_stored_question() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("ocr.db");
+        let e = MemoryEngine::builder()
+            .db_path(&path)
+            .build()
+            .await
+            .unwrap();
+        let text="数学错题整理\n姓名：梁子航\n1. 选择题：小明有12个苹果，平均分给4个小朋友，每个小朋友分到几个苹果？\nA. 2个　B. 3个 C 4个 X　D. 6个\n订正：12÷4=3（个）\n正确答案：B";
+        let body =
+            json!({"action":"import","kind":"image_ocr","source_id":"apple-photo","text":text});
+        let first = e.wrong_practice(body.clone()).await.unwrap();
+        let id = first["ids"][0].as_str().unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE memories SET content='旧错误正文：孩子答案没答上，解析占位句',metadata_json=json_set(metadata_json,'$.child_answer','没答上') WHERE id=?1",[id]).unwrap();
+        let second = e.wrong_practice(body).await.unwrap();
+        assert_eq!(second["ids"], first["ids"]);
+        let page = e.list(ListQuery::default()).await.unwrap();
+        assert_eq!(page.total, 1);
+        let record = &page.items[0];
+        assert_eq!(record.metadata["child_answer"], "C");
+        assert_eq!(record.metadata["answer"], "B");
+        assert!(
+            record.content.contains("孩子答案：C　正确答案：B"),
+            "{}",
+            record.content
+        );
+        assert!(
+            record.content.ends_with("解析：12÷4=3（个）"),
+            "{}",
+            record.content
+        );
+        assert!(!record.content.starts_with("1."));
     }
 }
