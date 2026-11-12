@@ -162,33 +162,86 @@ pub fn seed(conn: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) 
 pub fn recall(conn: &Connection, ns: &str, body: &Value) -> Result<Value> {
     let query = body["query"].as_str().unwrap_or("");
     let members = household::list_members(conn, ns)?;
-    let mut owners: Vec<String> = members
+    // 长别名优先：航航妈妈不能同时被短别名“航航”解析成孩子。
+    let named: Vec<_> = members
         .iter()
-        .filter(|m| query.contains(&m.display_name) || m.aliases.iter().any(|a| query.contains(a)))
-        .map(|m| m.member_id.clone())
+        .map(|m| {
+            let length = std::iter::once(m.display_name.as_str())
+                .chain(m.aliases.iter().map(String::as_str))
+                .filter(|name| !name.is_empty() && query.contains(name))
+                .map(|name| name.chars().count())
+                .max()
+                .unwrap_or(0);
+            (m, length)
+        })
         .collect();
-    // 对“航航妈妈/梁子航母亲”优先解析亲属主体，避免儿童姓名把母亲问题过滤掉。
-    if query.contains("妈妈") || query.contains("母亲") {
+    let longest = named.iter().map(|(_, n)| *n).max().unwrap_or(0);
+    let mut owners: Vec<String> = named
+        .iter()
+        .filter(|(_, n)| *n > 0 && *n == longest)
+        .map(|(m, _)| m.member_id.clone())
+        .collect();
+    // 预设家庭的亲属指称在主题匹配前解析；最后一个亲属词表示最终主体，
+    // 因此“我儿子的妈妈”与“我妈妈的儿子”不会反向归属。
+    let nearby_at = ["附近", "周边", "旁边", "周围"]
+        .iter()
+        .filter_map(|word| query.find(word))
+        .min()
+        .unwrap_or(query.len());
+    let subject = &query[..nearby_at];
+    let child_at = ["儿子", "孩子", "小孩", "娃", "小朋友", "宝宝"]
+        .iter()
+        .filter_map(|word| subject.rfind(word))
+        .max();
+    let mother_at = ["妈妈", "母亲", "母子"]
+        .iter()
+        .filter_map(|word| subject.rfind(word))
+        .max();
+    let relative_name = match (child_at, mother_at) {
+        (Some(c), Some(m)) if c > m => Some("梁子航"),
+        (_, Some(_)) => Some("宋娜娜"),
+        (Some(_), None) => Some("梁子航"),
+        _ => None,
+    };
+    if let Some(name) = relative_name {
         owners = members
             .iter()
-            .filter(|m| m.display_name == "宋娜娜")
-            .map(|m| m.member_id.clone())
-            .collect();
-    }
-    if query.contains("宋娜娜的儿子")
-        || query.contains("宋娜娜的孩子")
-        || (owners.is_empty() && (query.contains("儿子") || query.contains("孩子")))
-    {
-        owners = members
-            .iter()
-            .filter(|m| m.display_name == "梁子航")
+            .filter(|m| m.display_name == name)
             .map(|m| m.member_id.clone())
             .collect();
     }
     if owners.is_empty() {
         if let Some(id) = body["viewer_member_id"].as_str() {
-            owners.push(id.into());
+            owners = members
+                .iter()
+                .filter(|m| {
+                    m.member_id == id || m.display_name == id || m.aliases.iter().any(|a| a == id)
+                })
+                .map(|m| m.member_id.clone())
+                .collect();
         }
+    }
+    let workplace = ["上班", "单位", "工作", "医院", "下班", "公司"]
+        .iter()
+        .any(|word| subject.contains(word));
+    let school = [
+        "学校",
+        "校门",
+        "上学",
+        "放学",
+        "接娃",
+        "接孩子",
+        "接儿子",
+        "小学",
+    ]
+    .iter()
+    .any(|word| subject.contains(word));
+    let mut search = subject.to_string();
+    if workplace {
+        search.push_str(" 工作单位");
+    }
+    if school {
+        search.push_str(" 学校");
     }
     if owners.is_empty() {
         return Ok(json!({"hits":[]}));
@@ -218,17 +271,25 @@ pub fn recall(conn: &Connection, ns: &str, body: &Value) -> Result<Value> {
         if household::is_privacy(&meta) {
             continue;
         }
-        let score = meta["keywords"]
+        let mut score = meta["keywords"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .filter(|key| query.contains(key))
+            .filter(|key| search.contains(key))
             .map(|k| k.chars().count())
             .max()
             .unwrap_or(0);
         if score == 0 {
             continue;
+        }
+        // 查附近商户时，地点事实优先于“妈妈/儿子是谁”等关系事实。
+        let keys = meta["keywords"].as_array();
+        if keys.is_some_and(|keys| {
+            keys.iter()
+                .any(|k| (school && k == "学校") || (workplace && k == "单位"))
+        }) {
+            score += 10;
         }
         if let Some(memory) = store::get_memory(conn, Uuid::parse_str(&id).unwrap())? {
             hits.push(json!({"memory":memory,"scores":{"final_score":2.0+score as f64/10.0}}));
@@ -338,5 +399,132 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(graph.facts.len(), 1);
+    }
+    #[tokio::test]
+    async fn indirect_places_resolve_aliases_and_relatives_before_keywords() {
+        let d = tempfile::tempdir().unwrap();
+        let e = MemoryEngine::builder()
+            .db_path(d.path().join("m.db"))
+            .build()
+            .await
+            .unwrap();
+        let data = json!({"members":[
+            {"id":"child","name":"梁子航","role":"child","aliases":["航航"]},
+            {"id":"mom","name":"宋娜娜","role":"parent","aliases":["航航妈妈"]}],
+            "facts":[
+            {"owner":"mom","content":"宋娜娜的工作单位是北京同仁医院亦庄院区。","tag":"工作学习","domain":"education","source":"用户指定","keywords":["工作","单位"],"entity_type":"organization","entity_name":"北京同仁医院亦庄院区","relation":"工作单位"},
+            {"owner":"child","content":"梁子航在北京亦庄实验小学读一年级。","tag":"工作学习","domain":"education","source":"用户指定","keywords":["学校"],"entity_type":"school","entity_name":"北京亦庄实验小学","relation":"就读"}]});
+        e.wrong_practice(json!({"action":"family_seed","data":data}))
+            .await
+            .unwrap();
+        for (viewer, query, expected) in [
+            ("mom", "我工作单位附近有哪些咖啡店", "同仁医院"),
+            ("mom", "我儿子学校附近有哪些文具店", "实验小学"),
+            ("mom", "我是宋娜娜，我儿子学校旁边有什么公园", "实验小学"),
+            ("child", "航航妈妈上班的地方附近有药店吗", "同仁医院"),
+            ("mom", "我单位附近适合孩子吃饭的地方", "同仁医院"),
+            ("child", "我妈妈的单位旁边有什么学校", "同仁医院"),
+            ("mom", "我儿子的妈妈工作单位附近有什么公园", "同仁医院"),
+            ("mom", "我妈妈的儿子学校附近有什么文具店", "实验小学"),
+        ] {
+            let r = e
+                .wrong_practice(
+                    json!({"action":"family_recall","query":query,"viewer_member_id":viewer}),
+                )
+                .await
+                .unwrap();
+            assert!(
+                r["hits"][0]["memory"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(expected),
+                "{query}: {r}"
+            );
+        }
+        let filtered=e.wrong_practice(json!({"action":"family_recall","query":"我儿子学校附近的书店","viewer_member_id":"mom","member_id":"mom"})).await.unwrap();
+        assert!(filtered["hits"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_revision_reembeds_the_latest_fact_and_retires_old_vector() {
+        use std::sync::{Arc, Mutex};
+        struct RecordingEmbedder(Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl crate::Embedder for RecordingEmbedder {
+            fn model_id(&self) -> &str {
+                "revision-unit"
+            }
+            fn dimension(&self) -> usize {
+                2
+            }
+            async fn embed(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
+                self.0.lock().unwrap().extend(texts.iter().cloned());
+                Ok(texts
+                    .iter()
+                    .map(|s| {
+                        if s.contains("新单位") {
+                            vec![0.0, 1.0]
+                        } else {
+                            vec![1.0, 0.0]
+                        }
+                    })
+                    .collect())
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("m.db");
+        let embed = Arc::new(RecordingEmbedder(Mutex::new(vec![])));
+        let e = MemoryEngine::builder()
+            .db_path(&db)
+            .embedder(embed.clone())
+            .build()
+            .await
+            .unwrap();
+        let id = e
+            .remember(crate::RememberInput::episodic("宋娜娜在旧单位上班"))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if !e.get(id).await.unwrap().unwrap().embedding_pending {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!e.get(id).await.unwrap().unwrap().embedding_pending);
+        e.revise(
+            id,
+            crate::MemoryUpdate {
+                content: Some("宋娜娜在新单位上班".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if !e.get(id).await.unwrap().unwrap().embedding_pending {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let rec = e.get(id).await.unwrap().unwrap();
+        assert!(!rec.embedding_pending);
+        assert_eq!(rec.embedding_version, 2);
+        assert_eq!(
+            *embed.0.lock().unwrap(),
+            vec!["宋娜娜在旧单位上班", "宋娜娜在新单位上班"]
+        );
+        let conn = Connection::open(&db).unwrap();
+        let (version, vector): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT version,vector FROM embeddings WHERE memory_id=?1",
+                [id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(
+            vector,
+            [0.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat()
+        );
     }
 }
