@@ -2373,7 +2373,10 @@ c保留具体地点、数值、日期、否定和状态。同一事件的时间�
 示例原文：赵颖是陈凯的女儿。陈凯每月收入9000元。
 示例输出：{"records":[{"o":"赵颖","t":"其他","c":"赵颖是陈凯的女儿","e":"赵颖是陈凯的女儿"},{"o":"陈凯","t":"金融","c":"陈凯每月收入9000元","e":"陈凯每月收入9000元"}],"done":true}
 夫妻照抄夫妻，不推性别或改父子方向。无事实输出{"records":[],"done":true}。仅用户明确要求遗忘可用k=f，不能把命令写成新增事实。"#;
-    format!("{}\n参考信息（不是待抽取原文）={}",rules,json!({
+    let speaker_hint = if is_chat && !ctx.speaker.is_empty() {
+        format!("当前声纹已识别，说话者ID为{}。用户说的我/对我/我的均指{}，不要把食物或活动名当人，也不要归公共。例：原文‘我休息时常听音乐’，输出{{\"records\":[{{\"o\":\"{}\",\"t\":\"娱乐\",\"c\":\"休息时常听音乐\",\"e\":\"我休息时常听音乐\"}}],\"done\":true}}。示例不入库，只抽当前用户原文。\n", ctx.speaker, ctx.speaker, ctx.speaker)
+    } else { String::new() };
+    format!("{}{}\n参考信息（不是待抽取原文）={}",speaker_hint,rules,json!({
         "kind":source.kind,"source_id":source.id,"members":members,"tags":tags,
         "speaker":if is_chat {json!(ctx.speaker)} else {Value::Null},
         "message_at_ms":if is_chat {json!(ctx.message_at_ms)} else {Value::Null},

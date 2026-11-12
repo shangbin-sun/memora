@@ -50,18 +50,44 @@ fn answer(text: &str) -> String {
     Regex::new(r"答案[：:]\s*([^\n　（(]+)")
         .unwrap()
         .captures(text)
-        .map(|c| c[1].split("解析").next().unwrap_or("").trim().to_string())
+        .map(|c| {
+            let answer = c[1].split("解析").next().unwrap_or("").trim();
+            if answer.starts_with(['A', 'B', 'C', 'D']) {
+                answer.chars().next().unwrap().to_string()
+            } else {
+                answer.trim_end_matches(['。', '，', '!', '！']).to_string()
+            }
+        })
         .unwrap_or_default()
 }
 fn question(text: &str) -> String {
-    let t = Regex::new(r"孩子选择[：:][A-D]\s*")
+    let t = Regex::new(r"孩子选择[：:]\s*[A-D]\s*")
         .unwrap()
         .replace_all(text, "");
-    let t = t.split("答案").next().unwrap_or(&t).trim();
-    let t = Regex::new(r"[（(][√×][）)]")
+    let t = Regex::new(r"(?:订正|正确答案|解析)[：:]")
         .unwrap()
-        .replace_all(t, "（ ）");
-    t.to_string()
+        .split(&t)
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let t = t
+        .split("答案")
+        .next()
+        .unwrap_or(&t)
+        .trim()
+        .trim_end_matches("正确");
+    Regex::new(r"[（(][√×][）)]|[×✗❌]")
+        .unwrap()
+        .replace_all(t, "（ ）")
+        .to_string()
+}
+// 同题重传允许题干的常见等价说法与批改痕迹不同，保留最新原文及上一版来源。
+fn question_key(text: &str) -> String {
+    let stem = question(text).replace("每个小朋友分到几个苹果", "每人分到几个");
+    let stem = Regex::new(r"^\s*\d+[.．、。]\s*(?:选择题[：:]\s*)?")
+        .unwrap()
+        .replace(&stem, "");
+    norm(&stem)
 }
 fn record(
     conn: &Connection,
@@ -214,7 +240,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
     if source.is_empty() {
         return Ok(json!({"handled":true,"error":"缺少上传标识"}));
     }
-    let re = Regex::new(r"(?m)^\s*(\d{1,3})[.．、]\s*").unwrap();
+    let re = Regex::new(r"(?m)^\s*(\d{1,3})\s*[.．、。]\s*").unwrap();
     let matches: Vec<_> = re.captures_iter(&text).collect();
     if matches.is_empty() {
         return Ok(json!({"handled":true,"error":"未找到题号，未入库"}));
@@ -256,7 +282,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         }
         if let Some(old) = existing.iter().find(|old| {
             old.number == number
-                && norm(&old.raw) == norm(&q)
+                && question_key(&old.raw) == question_key(&q)
                 && old.meta["subjects"][0]["member_id"] == owner
         }) {
             let id = Uuid::parse_str(&old.id)
@@ -264,6 +290,13 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
             if let Some(mut rec) = store::get_memory(tx, id)? {
                 rec.metadata["uploaded_at_ms"] =
                     json!(body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms));
+                rec.metadata["latest_source_id"] = json!(source);
+                rec.metadata["previous_original_text"] = rec.metadata["original_text"].clone();
+                rec.metadata["original_text"] = json!(raw_q);
+                rec.metadata["source_name"] = body["name"].clone();
+                rec.metadata["image"] = json!(image);
+                rec.metadata["answer"] = json!(answer(&q));
+                rec.content = q.clone();
                 rec.updated_at_ms = now_ms();
                 store::update_memory(tx, &mut rec, jieba)?;
             }
@@ -272,7 +305,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
             continue;
         }
         let a = answer(&q);
-        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":labels(&q,heading),"answer":a,"weight":1.0,"source_id":source,"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":raw_q,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
+        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":labels(&q,heading),"answer":a,"weight":1.0,"source_id":source,"latest_source_id":source,"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":raw_q,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
         let id = record(tx, ns, jieba, &owner, &q, meta, None)?;
         ids.push(id);
         count += 1;
@@ -301,7 +334,7 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
     let sid = b["session_id"].as_str().unwrap_or("default");
     let mid = b["message_id"].as_str().unwrap_or("");
     if !mid.is_empty() {
-        if let Some(reply)=tx.query_row("SELECT reply FROM wrong_practice_turns WHERE namespace=?1 AND session_id=?2 AND message_id=?3",params![ns,sid,mid],|r|r.get::<_,String>(0)).optional()? { return Ok(json!({"handled":true,"reply":reply})); }
+        if let Some(reply)=tx.query_row("SELECT reply FROM wrong_practice_turns WHERE namespace=?1 AND session_id=?2 AND message_id=?3",params![ns,sid,mid],|r|r.get::<_,String>(0)).optional()? { return Ok(serde_json::from_str::<Value>(&reply).ok().filter(|v|v.is_object()).unwrap_or(json!({"handled":true,"reply":reply}))); }
     }
     let saved: Option<String> = tx
         .query_row(
@@ -315,25 +348,52 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
         .unwrap_or(json!({}));
     let active = state["active"].as_bool().unwrap_or(false);
     let types = query_types(query);
+    let number_re = Regex::new(r"(?:第\s*|题号\s*[是为：:]?\s*|[Qq])([0-9零〇一二两三四五六七八九十百]+)\s*(?:[道个]?题|号)?").unwrap();
+    let number_match = number_re
+        .captures(query)
+        .filter(|_| has(query, &["题", "练", "Q", "q"]));
+    let practice_action = Regex::new(r"复习|温习|重温|刷题|练习|练练|练一下|练一练|出.{0,4}题|来.{0,4}题|做.{0,4}题|考考|抽.{0,4}题").unwrap().is_match(query);
     let explicit = has(
         query,
         &[
             "错题",
             "出一道",
             "出一题",
-            "练一下",
             "练一道",
             "最新上传的题",
             "刚刚上传的题",
-            "第",
+        ],
+    ) || number_match.is_some()
+        || (practice_action && (active || has(query, &["题", "整理", "上传", "复习"])));
+    let count = has(
+        query,
+        &[
+            "多少",
+            "几道",
+            "几题",
+            "数量",
+            "总共",
+            "一共",
+            "总数",
+            "各有",
+            "几种",
+            "几首",
+            "几条",
+            "总计",
+            "有哪些题型",
+            "题型有哪些",
+            "分几类",
         ],
     );
-    let count = has(query, &["多少", "几道", "数量", "总共", "一共"]);
-    let today = has(query, &["今天", "今日", "当天"])
+    let today = (has(query, &["今天", "今日", "当天"])
+        || (active
+            && has(query, &["答对", "答错", "做对", "做错", "成绩", "答得"])
+            && !has(query, &["昨天", "前天", "上周"])))
         && has(
             query,
             &[
-                "答题", "答对", "答错", "复习", "情况", "练了", "做了", "记录",
+                "答题", "答对", "答错", "复习", "情况", "练了", "做了", "记录", "答得", "做得",
+                "做过", "成绩", "对了", "错了", "表现",
             ],
         );
     let follow = active
@@ -341,10 +401,19 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
             query,
             &[
                 "提示",
+                "线索",
+                "启发",
+                "引导",
+                "思路",
+                "怎么想",
+                "怎么做",
+                "带我想",
                 "不会",
                 "不知道",
                 "想不起来",
                 "下一题",
+                "换一题",
+                "换一道",
                 "再来",
                 "继续",
                 "再练",
@@ -372,20 +441,13 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
                         "好的",
                     ],
                 )));
-    if !(explicit || today || follow || (count && !types.is_empty())) {
+    if !(explicit
+        || today
+        || follow
+        || (count && (!types.is_empty() || has(query, &["题", "题型"]))))
+    {
         state["active"] = json!(false);
         save_state(tx, ns, sid, &state)?;
-        return Ok(json!({"handled":false}));
-    }
-    // 「第」只能和题目编号结合，不能接管普通日期、第一份报告等。
-    let number_re = Regex::new(r"第\s*([0-9一二三四五六七八九十]+)\s*[道个]?题").unwrap();
-    if explicit
-        && query.contains('第')
-        && !number_re.is_match(query)
-        && !has(query, &["错题", "练一下", "出一道", "出一题"])
-        && !follow
-        && !today
-    {
         return Ok(json!({"handled":false}));
     }
     let mut bank = load(tx, ns)?;
@@ -394,10 +456,7 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
         .iter()
         .filter(|m| query.contains(&m.display_name))
         .collect();
-    let requested = named
-        .first()
-        .map(|m| m.member_id.as_str())
-        .or_else(|| state["owner"].as_str());
+    let requested = named.first().map(|m| m.member_id.as_str());
     if let Some(owner) = requested {
         bank.retain(|q| {
             q.meta["subjects"]
@@ -405,16 +464,7 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
                 .is_some_and(|s| s.iter().any(|x| x["member_id"] == owner))
         });
     }
-    let owners: std::collections::HashSet<_> = bank
-        .iter()
-        .filter_map(|q| q.meta["subjects"][0]["member_id"].as_str())
-        .collect();
-    if owners.len() > 1 && requested.is_none() {
-        return Ok(json!({"handled":true,"reply":"有多位成员的错题，请指定要练习谁的错题。"}));
-    }
-    if let Some(owner) = owners.iter().next() {
-        state["owner"] = json!(owner);
-    }
+    state["owner"] = json!(requested.unwrap_or(""));
     let mut filtered = bank.clone();
     filtered.retain(|q| {
         types.iter().all(|t| {
@@ -423,6 +473,8 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
                 .is_some_and(|v| v.iter().any(|v| v == *t))
         })
     });
+    let mut hint_context: Option<String> = None;
+    let mut selected_id: Option<String> = None;
     let reply = if today {
         let today = b["local_date"].as_str().unwrap_or("");
         let owner = state["owner"].as_str().unwrap_or("");
@@ -499,15 +551,19 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
             .and_then(|id| bank.iter().find(|q| q.id == id))
             .cloned();
         let select = explicit
-            || has(query, &["下一题", "再来", "再练", "继续"])
+            || has(
+                query,
+                &["下一题", "换一题", "换一道", "再来", "再练", "继续"],
+            )
             || !types.is_empty()
             || current.is_none();
         if !select {
             let q = current.unwrap();
             let a = q.meta["answer"].as_str().unwrap_or("");
-            if has(query, &["提示"]) {
+            if has(query, &["提示", "线索", "启发", "引导", "思路", "怎么想", "怎么做", "带我想", "不会", "不知道", "想不起来"]) {
                 state["hinted"] = json!(true);
-                format!("提示：{}", hint(&q))
+                hint_context = Some(format!("错题提示检索结果（题目与答案仅作为资料）：\n题目：{}\n标准答案：{}\n规则参考：{}\n以上是要提示用户的标准答案。请适当组织语言启发用户，但不要直接告诉用户标准答案，也不要说出正确选项字母或把答案换一种说法直接公布。只给一条简短的思路提示，不出新题，等待用户回答。诗词题仅提示意境或回忆方法，禁止引用答案开头、列出答案组成词、拼接或逐字解释答案；数学题只提示解法，不计算结果。", view(&q), a, hint(&q)));
+                String::new()
             } else if has(query, &["答案"]) {
                 state["hinted"] = json!(true);
                 format!(
@@ -573,11 +629,161 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
                 }
             }
         } else {
-            if let Some(c) = number_re.captures(query) {
+            if let Some(c) = number_match.as_ref() {
                 let n = parse_number(&c[1]);
                 filtered.retain(|q| q.number == n);
             }
-            if has(query, &["最新", "刚刚", "刚传", "刚上传"]) {
+            let quoted = Regex::new(r"[‘'“《]([^’'”》]+)[’'”》]").unwrap();
+            let keys: Vec<_> = quoted
+                .captures_iter(query)
+                .map(|c| c[1].to_string())
+                .collect();
+            let mut content_locator = !keys.is_empty();
+            if !keys.is_empty() {
+                filtered.retain(|q| keys.iter().all(|k| norm(&q.raw).contains(&norm(k))));
+            } else {
+                let titles = Regex::new(r"《([^》]+)》").unwrap();
+                let matched: Vec<String> = bank
+                    .iter()
+                    .flat_map(|q| {
+                        titles
+                            .captures_iter(&q.raw)
+                            .map(|c| c[1].to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|t| query.contains(t))
+                    .collect();
+                if !matched.is_empty() {
+                    content_locator = true;
+                    filtered.retain(|q| matched.iter().any(|t| q.raw.contains(t)));
+                } else if number_match.is_none() {
+                    let mut content = query.to_string();
+                    for word in [
+                        "小北同学",
+                        "把整理的错题复习一下",
+                        "帮我",
+                        "给我",
+                        "出一道",
+                        "来一道",
+                        "拿出来",
+                        "温习",
+                        "重温",
+                        "换一道",
+                        "换一题",
+                        "看看",
+                        "考考",
+                        "给我出",
+                        "来一题",
+                        "给一道",
+                        "做一题",
+                        "来个",
+                        "做个",
+                        "这一题",
+                        "这份",
+                        "能不能",
+                        "麻烦",
+                        "帮忙",
+                        "做一道",
+                        "练一下",
+                        "练一练",
+                        "复习一下",
+                        "复习",
+                        "选择题",
+                        "判断题",
+                        "填空题",
+                        "数学题",
+                        "算术题",
+                        "语文题",
+                        "古诗题",
+                        "古诗词",
+                        "古诗",
+                        "题目",
+                        "错题",
+                        "那道",
+                        "那个",
+                        "一道",
+                        "最新",
+                        "刚刚",
+                        "刚上传",
+                        "上传",
+                        "上次",
+                        "上一批",
+                        "整理",
+                        "之前",
+                        "练练",
+                        "给点",
+                        "练习",
+                        "再来",
+                        "再练一次",
+                        "下一题",
+                        "继续",
+                        "有关",
+                        "关于",
+                        "的题",
+                        "一下",
+                    ] {
+                        content = content.replace(word, " ");
+                    }
+                    let tokens: Vec<_> = jieba
+                        .cut(&content, false)
+                        .into_iter()
+                        .filter(|w| {
+                            w.chars().count() >= 2
+                                && ![
+                                    "就要", "这道", "一题", "那题", "数量", "题型", "总共", "一共",
+                                ]
+                                .contains(w)
+                        })
+                        .collect();
+                    if !tokens.is_empty() {
+                        content_locator = true;
+                        let score = |q: &Q| -> usize {
+                            let stem = norm(&question(&q.raw));
+                            tokens
+                                .iter()
+                                .filter(|w| {
+                                    if w.chars().all(|c| c.is_ascii_digit()) {
+                                        Regex::new(&format!(
+                                            r"(?:^|[^0-9]){}(?:[^0-9]|$)",
+                                            regex::escape(w)
+                                        ))
+                                        .unwrap()
+                                        .is_match(&stem)
+                                    } else {
+                                        stem.contains(&norm(w))
+                                    }
+                                })
+                                .map(|w| w.chars().count())
+                                .sum()
+                        };
+                        let best = filtered.iter().map(score).max().unwrap_or(0);
+                        filtered.retain(|q| best > 0 && score(q) == best);
+                    }
+                }
+            }
+            let repeat_upload = has(
+                query,
+                &[
+                    "上次上传",
+                    "上一批上传",
+                    "刚才上传",
+                    "就要上次",
+                    "再做刚上传",
+                ],
+            );
+            let explicit_locator = content_locator
+                || number_match.is_some()
+                || !keys.is_empty()
+                || has(query, &["再练", "刚才那题"]);
+            let review_latest = !explicit_locator && types.is_empty() && practice_action;
+            if repeat_upload || has(query, &["最新", "刚刚", "刚传", "刚上传"]) || review_latest
+            {
+                if !repeat_upload && !explicit_locator {
+                    filtered.retain(|q| {
+                        q.meta["last_presented_upload_ms"].as_i64().unwrap_or(-1)
+                            < q.meta["uploaded_at_ms"].as_i64().unwrap_or(0)
+                    });
+                }
                 if let Some(latest) = filtered
                     .iter()
                     .filter_map(|q| q.meta["uploaded_at_ms"].as_i64())
@@ -585,24 +791,17 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
                 {
                     filtered.retain(|q| q.meta["uploaded_at_ms"] == latest);
                 }
-            }
-            let quoted = Regex::new(r"[‘'“《]([^’'”》]+)[’'”》]").unwrap();
-            let keys: Vec<_> = quoted
-                .captures_iter(query)
-                .map(|c| c[1].to_string())
-                .collect();
-            if !keys.is_empty() {
-                filtered.retain(|q| keys.iter().all(|k| norm(&q.raw).contains(&norm(k))));
-            } else if query.contains("咬定青山") {
-                filtered.retain(|q| q.raw.contains("咬定青山"));
-            } else if query.contains("竹石") {
-                filtered.retain(|q| q.raw.contains("竹石"));
+            } else if !explicit_locator {
+                filtered.retain(|q| {
+                    q.meta["last_presented_upload_ms"].as_i64().unwrap_or(-1)
+                        < q.meta["uploaded_at_ms"].as_i64().unwrap_or(0)
+                });
             }
             if has(query, &["再练"]) && current.is_some() {
                 filtered = vec![current.unwrap()];
             }
             if filtered.is_empty() {
-                "没有找到符合条件的错题，请换个题型、编号或题目关键词。".into()
+                "没有找到尚未出过且符合条件的错题。可以指定题号或明确说复习上次上传的错题。".into()
             } else {
                 let total: f64 = filtered
                     .iter()
@@ -617,9 +816,20 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
                         sum > random
                     })
                     .unwrap_or(&filtered[0]);
+                if let Some(mut rec) = store::get_memory(
+                    tx,
+                    Uuid::parse_str(&q.id)
+                        .map_err(|e| crate::error::MemoraError::InvalidState(e.to_string()))?,
+                )? {
+                    rec.metadata["last_presented_upload_ms"] = q.meta["uploaded_at_ms"].clone();
+                    rec.metadata["last_presented_at_ms"] = json!(now_ms());
+                    store::update_memory(tx, &mut rec, jieba)?;
+                }
+                state["owner"] = q.meta["subjects"][0]["member_id"].clone();
                 state["poem"] = json!(q.meta["question_types"]
                     .as_array()
                     .is_some_and(|v| v.contains(&json!("古诗题"))));
+                selected_id = Some(q.id.clone());
                 state["current"] = json!(q.id);
                 state["active"] = json!(true);
                 state["answered"] = json!(false);
@@ -632,16 +842,16 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
     if !mid.is_empty() {
         tx.execute(
             "INSERT INTO wrong_practice_turns VALUES(?1,?2,?3,?4)",
-            params![ns, sid, mid, reply],
+            params![ns, sid, mid, json!({"handled":true,"reply":reply,"hint_context":hint_context,"question_id":selected_id}).to_string()],
         )?;
     }
-    Ok(json!({"handled":true,"reply":reply}))
+    Ok(json!({"handled":true,"reply":reply,"hint_context":hint_context,"question_id":selected_id}))
 }
 fn parse_number(s: &str) -> i64 {
     s.parse().unwrap_or_else(|_| {
         let digits = |s: &str| match s {
             "一" => 1,
-            "二" => 2,
+            "二" | "两" => 2,
             "三" => 3,
             "四" => 4,
             "五" => 5,
@@ -691,15 +901,21 @@ fn judge(q: &Q, input: &str) -> Option<bool> {
         };
     }
     if a.len() == 1 && "ABCD".contains(a) {
-        let re = Regex::new(r"^(?:我选|选|答案是|选项)?\s*([ABCDabcd])(?:[。！!])?$").unwrap();
+        let re = Regex::new(
+            r"^(?:我选|选择|选|应该是|我觉得是|答案选|答案是|选项)?\s*([ABCDabcd])(?:[。！!])?$",
+        )
+        .unwrap();
         if let Some(c) = re.captures(input) {
             return Some(c[1].eq_ignore_ascii_case(a));
         }
-        let options = q.raw.lines().filter(|l| l.contains("A.")).collect::<Vec<_>>().join(" ");
+        let options = question(&q.raw).replace('\n', " ");
         for option in ["A", "B", "C", "D"] {
-            let opt = Regex::new(&format!(r"{}[.．、]\s*(.*?)(?:[ABCD][.．、]|$)", option)).unwrap();
+            let opt =
+                Regex::new(&format!(r"{}[.．、]\s*(.*?)(?:[ABCD][.．、]|$)", option)).unwrap();
             if let Some(c) = opt.captures(&options) {
-                if norm(&c[1]) == n { return Some(option == a); }
+                if norm(&c[1]) == n {
+                    return Some(option == a);
+                }
             }
         }
         return None;
@@ -712,10 +928,10 @@ fn judge(q: &Q, input: &str) -> Option<bool> {
 }
 fn hint(q: &Q) -> String {
     if q.raw.contains("千锤万凿") {
-        return "想一想石灰经历粉碎焚烧仍不畏惧，空缺诗句以“粉骨”开头。".into();
+        return "联系石灰经受磨难仍保持清白的意境，先在心中从上一句往下背。".into();
     }
     if q.raw.contains("咬定青山") {
-        return "竹子不怕任何方向的风，末句以“任尔”开头，注意东西南北的顺序。".into();
+        return "想一想最后一句怎样衬托竹子经历磨难仍然坚定，先从前一句在心中往下背。".into();
     }
     if q.raw.contains("苹果") {
         return "平均分，用苹果总数除以小朋友人数。".into();
@@ -723,14 +939,7 @@ fn hint(q: &Q) -> String {
     if q.raw.contains("周长") {
         return "想想正方形有几条相等的边。".into();
     }
-    if let Some((_, s)) = q.raw.split_once("解析：") {
-        return s.into();
-    }
-    let a = q.meta["answer"].as_str().unwrap_or("");
-    format!(
-        "回忆题干中的关键词，答案以“{}”开头。",
-        a.chars().next().map(|c| c.to_string()).unwrap_or_default()
-    )
+    "先找题干的已知条件和所问内容，回忆相关知识，再尝试作答。".into()
 }
 #[cfg(test)]
 mod tests {
@@ -822,7 +1031,7 @@ mod tests {
         let (_d, e) = setup().await;
         let r = ask(&e, "出一道‘石灰吟’的填空题", "1").await;
         assert!(r["reply"].as_str().unwrap().contains("千锤"));
-        assert!(ask(&e, "提示一下", "2").await["reply"]
+        assert!(ask(&e, "提示一下", "2").await["hint_context"]
             .as_str()
             .unwrap()
             .contains("粉骨"));
@@ -875,5 +1084,74 @@ mod tests {
             household::select_memory_tag(&tags, &json!({"tag":"错题集"}), "我爱吃鱼", &[]),
             "错题集"
         );
+    }
+}
+
+#[cfg(test)]
+mod demo_v2_tests {
+    use super::*;
+    use crate::MemoryEngine;
+    #[tokio::test]
+    async fn latest_upload_is_shared_persistent_and_not_repeated_without_explicit_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("demo.db");
+        let e = MemoryEngine::builder()
+            .db_path(&path)
+            .build()
+            .await
+            .unwrap();
+        for (source, at, num) in [("old", 10, 3), ("fresh", 20, 1)] {
+            let text=format!("数学错题整理\n姓名：梁子航\n{}. 选择题：12个苹果平均分给4人？\nA. 2个\nB. 3个\nC. 4个 ×\nD. 6个\n订正：12÷4=3（个）\n正确答案：B",num);
+            assert_eq!(e.wrong_practice(json!({"action":"import","source_id":source,"text":text,"kind":"image_ocr","uploaded_at_ms":at})).await.unwrap()["count"],1);
+        }
+        let a=e.wrong_practice(json!({"query":"把整理的错题复习一下","session_id":"s","message_id":"a","speaker_id":"unknown"})).await.unwrap();
+        assert!(a["reply"].as_str().unwrap().starts_with("第1题"));
+        assert!(!a["reply"].as_str().unwrap().contains("订正"));
+        assert_eq!(
+            e.wrong_practice(
+                json!({"query":"把整理的错题复习一下","session_id":"s","message_id":"a"})
+            )
+            .await
+            .unwrap()["reply"],
+            a["reply"]
+        );
+        e.shutdown();
+        drop(e);
+        let e = MemoryEngine::builder()
+            .db_path(&path)
+            .build()
+            .await
+            .unwrap();
+        let b = e
+            .wrong_practice(
+                json!({"query":"把整理的错题复习一下","session_id":"another","speaker_id":"别人"}),
+            )
+            .await
+            .unwrap();
+        assert!(b["reply"].as_str().unwrap().starts_with("第3题"));
+        let c = e
+            .wrong_practice(json!({"query":"就要上次上传的错题","session_id":"s"}))
+            .await
+            .unwrap();
+        assert_eq!(c["question_id"], a["question_id"]);
+        let hint = e
+            .wrong_practice(json!({"query":"提示一下","session_id":"s"}))
+            .await
+            .unwrap();
+        assert!(hint["hint_context"]
+            .as_str()
+            .unwrap()
+            .contains("标准答案：B"));
+        assert_eq!(hint["reply"], "");
+        for query in ["能给一点思路吗", "这道题怎么想", "我不会", "带我想一下"] {
+            let r = e.wrong_practice(json!({"query":query,"session_id":"s"})).await.unwrap();
+            assert!(r["hint_context"].as_str().unwrap().contains("标准答案：B"));
+            assert_eq!(r["reply"], "");
+        }
+        let answer = e
+            .wrong_practice(json!({"query":"3个","session_id":"s","local_date":"2026-11-12"}))
+            .await
+            .unwrap();
+        assert!(answer["reply"].as_str().unwrap().contains("答对"));
     }
 }
