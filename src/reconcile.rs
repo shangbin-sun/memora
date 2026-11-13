@@ -844,6 +844,7 @@ async fn apply_staged(
     let message_at_ms = context.message_at_ms;
     // This is intentionally AFTER every source has passed extraction coverage.
     ensure_public_member(engine, ns).await?;
+    let rule_members = engine.list_members(ns).await?;
     let bundle = prompt_latest();
     let mut registers = Vec::new();
     let mut memories = Vec::new();
@@ -852,7 +853,7 @@ async fn apply_staged(
     let mut extract_raw_last: Option<String> = None;
     // Count validated records after exact source-local deduplication; overlapping
     // hard windows must not inflate the report with the same wire record.
-    let memories_extracted = extraction.valid_records;
+    let mut memories_extracted = extraction.valid_records;
     let mut warnings = Vec::new();
     let mut part_text: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let turn_has_attachment = sources.iter().any(|source| source.kind != "user_text");
@@ -861,7 +862,17 @@ async fn apply_staged(
         let source_intent=if root_source.kind=="user_text" {user_memory_intent(&root_source.text)}else{None};
         for staged_part in staged_source.parts {
             let part = staged_part.source;
-            let parsed = staged_part.parsed;
+            let mut parsed = staged_part.parsed;
+            if part.kind=="user_text" && source_intent.is_none() {
+                let rule_facts=crate::memory_rules::analyze(&part.text,&rule_members,Some(explicit_speaker));
+                for f in rule_facts.facts {
+                    if crate::memory_rules::rejection(&root_source.text,&f.evidence).is_some() {continue;}
+                    if parsed.memories.iter().filter(|item|crate::memory_rules::review(&root_source.text,item["evidence"].as_str().unwrap_or(""),item["content"].as_str().unwrap_or("")).is_none()).any(|item| item["evidence"].as_str().is_some_and(|e|e.chars().count()>=4 && (f.evidence.contains(e)||e.contains(f.evidence.as_str())))) {continue;}
+                    parsed.memories.push(json!({"owner":f.owner,"subjects":[f.owner],"content":f.content,"tag":f.tag,"evidence":f.evidence,"source_id":part.id,"event_at":null}));
+                    memories_extracted+=1;
+                    warnings.push("extract supplemented by grounded fact rules".into());
+                }
+            }
             extract_raw_last = staged_part.raw.or(extract_raw_last);
             if part.preserve_original && !matches!(&source_intent,Some(UserMemoryIntent::Decline)) {
                 part_text.insert(part.id.clone(), part.text.clone());
@@ -882,6 +893,9 @@ async fn apply_staged(
                     }
                     // Deletion always needs the user's own words. People may be introduced
                     // by an uploaded document, which is how a cold start learns who is who.
+                    if key=="register" && part.kind=="user_text" && (crate::memory_rules::rejection(&root_source.text,item["evidence"].as_str().unwrap_or("")).is_some() || !crate::memory_rules::explicit_person_introduction(item["evidence"].as_str().unwrap_or(""),item["display_name"].as_str().unwrap_or(""))) {
+                        warnings.push("extract drop nonfactual person registration".into());continue;
+                    }
                     if key == "retractions" && part.kind != "user_text" {
                         continue;
                     }
@@ -900,7 +914,12 @@ async fn apply_staged(
                     if key == "memories" && part.kind == "user_text" {
                         let evidence = item["evidence"].as_str().unwrap_or("");
                         let content = item["content"].as_str().unwrap_or("");
-                        if crate::question_turn::evidence_in_question(&part.text, evidence)
+                        let first_person=regex::Regex::new(r"^(?:我|我的)").unwrap().is_match(evidence.trim()) || part.text.trim().starts_with('我');
+                        if first_person && !rule_members.iter().any(|m|m.member_id==explicit_speaker && !crate::household::is_shared_member_id(&m.member_id)) {
+                            warnings.push("extract drop first person without verified speaker".into());continue;
+                        }
+                        if crate::memory_rules::review(&root_source.text,evidence,content).is_some()
+                            || crate::question_turn::evidence_in_question(&part.text, evidence)
                             || crate::question_turn::describes_the_asking(content)
                         {
                             warnings.push("extract drop fact taken from a question".into());
@@ -919,6 +938,43 @@ async fn apply_staged(
                         json!([root_source.id, extracted_item_key(key, body, item)]).to_string(),
                     ) {
                         let mut accepted = item.clone();
+                        if key=="memories" && part.kind=="user_text" {
+                            let evidence=item["evidence"].as_str().unwrap_or("");
+                            let analysis=crate::memory_rules::analyze(&part.text,&rule_members,Some(explicit_speaker));
+                            let matching:Vec<_>=analysis.facts.iter().filter(|f|evidence.chars().count()>=2 && !["喜欢","我的","最近","每天","每月"].contains(&evidence) && (f.evidence.contains(evidence)||evidence.contains(f.evidence.as_str()))).collect();
+                            if matching.len()==1 {
+                                let f=matching[0];
+                                accepted["owner"]=json!(f.owner);accepted["subjects"]=json!([f.owner]);
+                                accepted["content"]=json!(f.content);accepted["tag"]=json!(f.tag);
+                                accepted["evidence"]=json!(f.evidence);accepted["event_at"]=Value::Null;accepted["_host_rule_validated"]=json!(true);
+                                warnings.push("extract verified by grounded fact rules".into());
+                            }
+                        }
+
+                        if key=="memories" && part.kind=="user_text" {
+                            let evidence=accepted["evidence"].as_str().unwrap_or("");
+                            let clear_self=evidence.trim().starts_with('我') && !regex::Regex::new(r"^我(?:的)?(?:妈妈|爸爸|老婆|老公|孩子|儿子|女儿|哥哥|姐姐|朋友|同事|老师|爷爷|奶奶|国|司|校|给|帮|替|跟|和|带)").unwrap().is_match(evidence.trim());
+                            if clear_self {
+                                if let Some(speaker)=rule_members.iter().find(|m|m.member_id==explicit_speaker) {
+                                    let owner=accepted["owner"].as_str().unwrap_or("");
+                                    if ["我","自己","本人",explicit_speaker].contains(&owner) {
+                                        accepted["owner"]=json!(speaker.member_id);accepted["subjects"]=json!([speaker.member_id]);
+                                        if let Some(rest)=accepted["content"].as_str().unwrap_or("").strip_prefix('我') {accepted["content"]=json!(format!("{}{rest}",speaker.display_name));}
+                                    }
+                                }
+                            }
+                            if !engine.rule_content_supported(accepted["evidence"].as_str().unwrap_or(""),accepted["content"].as_str().unwrap_or(""),&rule_members) {
+                                warnings.push("extract drop unsupported noun or named entity".into());continue;
+                            }
+                            if let Some(tag)=crate::memory_rules::category_hint(accepted["evidence"].as_str().unwrap_or("")).filter(|_|accepted["_host_rule_validated"]!=true) {
+                                if accepted["tag"].as_str()!=Some(tag) {accepted["tag"]=json!(tag);warnings.push("extract category verified by grounded fact rules".into());}
+                            }
+                            let owner=accepted["owner"].as_str().unwrap_or("");
+                            let known=rule_members.iter().any(|m|m.member_id==owner || m.display_name==owner || m.aliases.iter().any(|a|a==owner));
+                            if !known && !crate::household::is_shared_member_id(owner) && !crate::memory_rules::explicit_person_introduction(accepted["evidence"].as_str().unwrap_or(""),owner) {
+                                warnings.push("extract drop new person without explicit introduction".into());continue;
+                            }
+                        }
                         let label=item.get(if key=="register" {"display_name"}else{"owner"}).and_then(Value::as_str).unwrap_or("");
                         accepted["_host_non_person_label"]=json!(root_source.kind!="user_text" && non_person_source_label(label,&root_source.text));
                         accepted["_host_graph_already_ingested"] =
@@ -1187,7 +1243,7 @@ async fn apply_staged(
     }
     let mut written_ids = Vec::new();
     let mut revised_ids = Vec::new();
-    let fallback_used = false;
+    let fallback_used = warnings.iter().any(|w|w.contains("grounded fact rules"));
     let mut ops_raw = None;
     performance.mark("validate_and_retract");
 
@@ -2626,5 +2682,69 @@ mod document_owner_type_regressions {
         assert!(validated_owner(&json!({"owner":"ASSET102","subjects":["ASSET102"],"_host_non_person_label":true}),&[]).is_none());
         let member=HouseholdMember{member_id:"ASSET102".into(),display_name:"王明".into(),role:MemberRole::Other,aliases:vec![],age_band:None};
         assert_eq!(validated_owner(&json!({"owner":"ASSET102","subjects":["ASSET102"],"_host_non_person_label":true}),&[member]),Some("ASSET102".into()));
+    }
+}
+
+#[cfg(test)]
+mod grounded_rule_integration_tests {
+    use super::*;
+    use crate::{ListQuery,QianfanConfig};
+    async fn fixture()->(tempfile::TempDir,MemoryEngine) {
+        let d=tempfile::tempdir().unwrap();let e=MemoryEngine::builder().db_path(d.path().join("rules.db")).build().await.unwrap();
+        for (id,name) in [("child","梁子航"),("mom","宋娜娜")] {e.upsert_member(None,HouseholdMember{member_id:id.into(),display_name:name.into(),role:MemberRole::Other,aliases:vec![],age_band:None}).await.unwrap();}
+        (d,e)
+    }
+    async fn apply(e:&MemoryEngine,text:&str,speaker:Option<&str>,evidence:Option<&str>,partial:bool)->ReconcileReport {
+        let req:ReconcileRequest=serde_json::from_value(json!({"query":text,"speaker_id":speaker})).unwrap();
+        let source:EvidenceSource=serde_json::from_value(json!({"id":"test","kind":"user_text","text":text})).unwrap();
+        let mut parsed=crate::reconcile_protocol::parse_extraction("{\"done\":true}","test",text,false);
+        if let Some(evidence)=evidence {parsed.memories.push(json!({"owner":"mom","subjects":["mom"],"content":"宋娜娜喜欢吃酸菜鱼","tag":"医疗健康","event_at":null,"source_id":"test","evidence":evidence}));}
+        let part=crate::long_extract::StagedPart{source:source.clone(),parsed,raw:None,start:0,end:text.chars().count(),context:json!({}),error:None};
+        let stage=crate::long_extract::StagedSource{parts:vec![part],..Default::default()};
+        let members=e.list_members(None).await.unwrap();let tags=e.list_tags(None).await.unwrap();
+        let context=crate::long_extract::ExtractContext{roster:roster_prompt(&members),tags:tags_prompt(&tags),speaker:speaker.unwrap_or("").into(),transcript:String::new(),message_at_ms:1794570000000};
+        let mut config=QianfanConfig::for_embed("unit".into(),None,None,None);config.chat_url="http://127.0.0.1:1/never-called".into();
+        let chat=QianfanChat::new(config).unwrap();
+        apply_staged(e,&chat,req,context,vec![source],vec![stage],ExtractionProgress{partial,..Default::default()}).await.unwrap()
+    }
+    #[tokio::test]
+    async fn invented_facts_from_hypotheses_quotes_and_unknown_voices_never_reach_sqlite() {
+        for (text,evidence,speaker) in [
+            ("如果我喜欢吃酸菜鱼就好了","我喜欢吃酸菜鱼",Some("child")),
+            ("我喜欢吃酸菜鱼吗？","喜欢吃酸菜鱼",Some("child")),
+            ("她说‘我喜欢吃酸菜鱼’","我喜欢吃酸菜鱼",Some("child")),
+            ("我喜欢吃酸菜鱼","我喜欢吃酸菜鱼",None),
+            ("我喜欢吃酸菜鱼","喜欢吃酸菜鱼",None),
+        ] {
+            let (_d,e)=fixture().await;let report=apply(&e,text,speaker,Some(evidence),false).await;
+            assert!(report.written_ids.is_empty(),"{text}");assert_eq!(e.list(ListQuery::default()).await.unwrap().total,0,"{text}");
+        }
+    }
+    #[tokio::test]
+    async fn model_owner_and_tag_are_corrected_from_known_speaker_and_exact_evidence() {
+        let (_d,e)=fixture().await;
+        let report=apply(&e,"我喜欢吃酸菜鱼，今天风很大",Some("child"),Some("我喜欢吃酸菜鱼"),false).await;
+        assert_eq!(report.written_ids.len(),1);
+        let list=e.list(ListQuery::default()).await.unwrap();let f=&list.items[0];
+        assert_eq!(f.content,"梁子航喜欢吃酸菜鱼");assert_eq!(f.tag,"饮食");assert_eq!(f.subject_ids,vec!["child"]);
+    }
+    #[tokio::test]
+    async fn omitted_safe_fact_is_supplemented_without_hiding_partial_status() {
+        let (_d,e)=fixture().await;
+        let report=apply(&e,"我喜欢吃酸菜鱼，今天风很大",Some("child"),None,true).await;
+        assert_eq!(report.written_ids.len(),1);assert!(report.extraction.partial);assert!(report.fallback_used);
+        assert_eq!(e.list(ListQuery::default()).await.unwrap().items[0].tag,"饮食");
+    }
+    #[tokio::test]
+    async fn eight_categories_store_through_fast_path_without_any_model() {
+        let (_d,e)=fixture().await;let members=e.list_members(None).await.unwrap();
+        for (text,tag) in [("我喜欢吃酸菜鱼","饮食"),("我爱好摄影","娱乐"),("我正在学习Rust","工作学习"),("我对花粉过敏","医疗健康"),("我明天坐高铁去南京","出行"),("我每天晚上九点睡觉","生活习惯"),("我每月零花钱300元","金融"),("我的生日是6月18日","其他")] {
+            let req:ReconcileRequest=serde_json::from_value(json!({"query":text,"speaker_id":"child"})).unwrap();
+            let source:EvidenceSource=serde_json::from_value(json!({"id":"unit","kind":"user_text","text":text})).unwrap();
+            let report=crate::simple_preferences::remember(&e,&req,&members,&[source]).await.unwrap().unwrap();
+            assert_eq!(report.facts[0]["tag"],tag);
+        }
+        let list=e.list(ListQuery{limit:Some(100),..Default::default()}).await.unwrap();assert_eq!(list.total,8);
+        for f in list.items {assert_eq!(f.subject_ids,vec!["child"]);assert_eq!(f.metadata["rule"],"grounded_fact_rules_v2");}
     }
 }

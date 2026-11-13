@@ -278,6 +278,8 @@ struct ReviseBody {
     id: String,
     content: String,
     #[serde(default)]
+    expected_revision: Option<i64>,
+    #[serde(default)]
     summary: Option<String>,
     /// When present, overwrite household subjects (`[]` = public).
     #[serde(default)]
@@ -667,7 +669,7 @@ fn revise_update(body: ReviseBody, record: crate::types::MemoryRecord) -> crate:
         }
     }
     Ok(MemoryUpdate {
-        expected_revision: Some(record.revision),
+        expected_revision: body.expected_revision.or(Some(record.revision)),
         content: Some(normalized.content.clone()),
         summary: body.summary.or(Some(normalized.content)),
         metadata: Some(meta),

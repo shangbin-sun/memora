@@ -372,7 +372,7 @@ mod tests {
             .unwrap();
         let mut data = json!({"version":200,"members":[{"id":"child","name":"梁子航","role":"child","aliases":["航航"]}],"facts":[{"owner":"child","content":"梁子航对花生过敏。","tag":"医疗健康","domain":"medical","source":"演示补充","keywords":["过敏"],"entity_type":"substance","entity_name":"花生","relation":"过敏"}]});
         let wrong =
-            "错题集\n姓名：梁子航\n2. 判断：所有偶数都是合数。（√）\n正确答案：×\n解析：2是质数。";
+            "错题集\n姓名：梁子航\n<!-- question_tags: {\"number\":2,\"tags\":[\"数学题\",\"判断题\"]} -->\n2. 判断：所有偶数都是合数。（√）\n正确答案：×\n解析：2是质数。";
         let result = e
             .wrong_practice(json!({"action":"family_seed","data":data,"wrong_questions":wrong}))
             .await

@@ -17,31 +17,61 @@ fn norm(s: &str) -> String {
         .flat_map(char::to_lowercase)
         .collect()
 }
-fn arithmetic_labels(text: &str) -> Vec<String> {
-    // 只看题干，排除孩子答案、正确答案、解析和选择项中的干扰运算。
-    let body = before_answer_fields(text).split("解析").next().unwrap_or(text);
-    let body = choice_spans(body).first().map(|c| &body[..c.start]).unwrap_or(body);
-    let binary = |op: &str| Regex::new(&format!(r"[0-9)）]\s*[{}]\s*[0-9(（]",op)).unwrap().is_match(body);
-    let singles=body.replace("加减法", "").replace("乘除法", "");
-    let add = has(&singles,&["加法","加上","相加"]) || binary("+＋");
-    let sub = has(&singles,&["减法","减去","相减","还剩","剩下"]) || binary("-－−");
-    let mul = has(&singles,&["乘法","乘以","相乘"]) || binary("×✕*xX");
-    let div = has(&singles,&["除法","除以","相除","平均分","均分"]) || binary("÷")
-        || (has(body,&["计算","求值","="]) && binary("/"));
-    let mut tags = Vec::new();
-    for (on,tag) in [(add,"加法题"),(sub,"减法题"),(add||sub||body.contains("加减法"),"加减法题"),(mul,"乘法题"),(div,"除法题"),(mul||div||body.contains("乘除法"),"乘除法题")] {
-        if on { tags.push(tag.to_string()); }
+const QUESTION_TAGS: &[&str] = &["数学题","语文题","选择题","判断题","填空题","算术题","几何题","古诗题","加法题","减法题","加减法题","乘法题","除法题","乘除法题","分数题","时间计算题","单位换算题","数的认识题","应用题"];
+
+fn validated_question_tags(value: &Value) -> Option<Vec<String>> {
+    let values=value.as_array()?;
+    if !(2..=12).contains(&values.len()) {return None;}
+    let mut tags=Vec::new();
+    for value in values {
+        let tag=value.as_str()?;
+        if !QUESTION_TAGS.contains(&tag) {return None;}
+        if !tags.iter().any(|t|t==tag) {tags.push(tag.to_string());}
     }
-    tags
+    if !tags.iter().any(|t|t=="数学题" || t=="语文题") {return None;}
+    Some(tags)
+}
+
+fn resolved_question_labels(entry: &Value, text: &str, heading: &str) -> Value {
+    if entry["question_label_source"]=="edge_model" {
+        if let Some(mut tags)=validated_question_tags(&entry["question_types"]) {
+            for (children,parent) in [(["加法题","减法题"],"加减法题"),(["乘法题","除法题"],"乘除法题")] {
+                if tags.iter().any(|t|children.contains(&t.as_str())) {
+                    for tag in [parent,"算术题"] {if !tags.iter().any(|t|t==tag) {tags.push(tag.into());}}
+                }
+            }
+            let rules=crate::question_rules::classify(text,heading);
+            if let Some(corrected)=crate::question_rules::validate_model(&tags,&rules) {
+                return json!({"question_types":corrected,"question_label_source":"rules_corrected","question_label_reason":"model_conflicts_with_question_evidence"});
+            }
+            return json!({"question_types":tags,"question_label_source":"edge_model","question_label_reason":null});
+        }
+    }
+    json!({"question_types":labels(text,heading),"question_label_source":"rules_fallback","question_label_reason":entry["question_label_reason"].as_str().unwrap_or("missing_or_invalid_model_labels")})
+}
+
+pub(crate) fn relabel_edited_question(rec: &mut MemoryRecord, patch: Option<&Value>) {
+    let current_patch=patch.filter(|p|p["question_label_text"].as_str()==Some(rec.content.as_str()));
+    let resolved=resolved_question_labels(current_patch.unwrap_or(&Value::Null),&rec.content,"");
+    for key in ["question_types","question_label_source","question_label_reason"] {rec.metadata[key]=resolved[key].clone();}
+    rec.metadata["arithmetic_labels_version"]=json!(1);
+    rec.metadata["question_edited"]=json!(true);
+    rec.metadata["answer"]=json!(answer(&rec.content));
+    rec.metadata["child_answer"]=json!(child_answer(&rec.content,""));
+    if let Some(meta)=rec.metadata.as_object_mut() {meta.remove("last_presented_upload_ms");}
+}
+
+fn arithmetic_labels(text: &str) -> Vec<String> {
+    crate::question_rules::classify(text,"").tags.into_iter().filter(|t|["加法题","减法题","加减法题","乘法题","除法题","乘除法题"].contains(&t.as_str())).collect()
 }
 
 // 升级旧题只补标签，不改正文、上传时间或UI排序。
 fn refresh_arithmetic_labels(conn: &Connection, ns: &str, jieba: &jieba_rs::Jieba) -> Result<()> {
     for q in load(conn,ns)? {
-        if q.meta["arithmetic_labels_version"] == 1 { continue; }
+        if q.meta["arithmetic_labels_version"] == 1 || q.meta["question_label_source"]=="preset" || matches!(q.meta["question_label_source"].as_str(),Some("edge_model"|"rules_corrected")) { continue; }
         let id=Uuid::parse_str(&q.id).map_err(|e|crate::error::MemoraError::InvalidState(e.to_string()))?;
         let Some(mut rec)=store::get_memory(conn,id)? else { continue; };
-        let source=rec.metadata["original_text"].as_str().unwrap_or(&rec.content);
+        let source=if rec.metadata["question_edited"]==true {rec.content.as_str()} else {rec.metadata["original_text"].as_str().unwrap_or(&rec.content)};
         let mut tags=rec.metadata["question_types"].as_array().cloned().unwrap_or_default();
         for tag in arithmetic_labels(source) {
             if !tags.contains(&json!(tag)) { tags.push(json!(tag)); }
@@ -55,29 +85,7 @@ fn refresh_arithmetic_labels(conn: &Connection, ns: &str, jieba: &jieba_rs::Jieb
 }
 
 fn labels(text: &str, heading: &str) -> Vec<String> {
-    let t = format!("{heading}{text}");
-    let mut v = Vec::new();
-    if has(&t, &["古诗", "诗句", "《", "竹石", "咬定青山"]) {
-        v.extend(["古诗题", "语文题", "填空题"]);
-    } else {
-        v.push("数学题");
-        if has(&t, &["选择题", "A.", "A．", "A、"]) {
-            v.push("选择题");
-        }
-        if has(&t, &["判断题", "√", "×）", "×)"]) {
-            v.push("判断题");
-        }
-        if has(&t, &["计算", "苹果", "分数", "数", "÷", "×", "小时"]) {
-            v.push("算术题");
-        }
-        if has(&t, &["周长", "面积", "三角形", "平行四边形"]) {
-            v.push("几何题");
-        }
-    }
-    let mut tags: Vec<String> = v.into_iter().map(str::to_string).collect();
-    for tag in arithmetic_labels(text) { if !tags.contains(&tag) { tags.push(tag); } }
-    if tags.iter().any(|t| ["加法题","减法题","乘法题","除法题"].contains(&t.as_str())) && !tags.iter().any(|t|t=="算术题") { tags.push("算术题".into()); }
-    tags
+    crate::question_rules::classify(text,heading).tags
 }
 fn answer(text: &str) -> String {
     // 已知资料勘误：保留事实原文，判题元数据明确记录修正。
@@ -405,7 +413,7 @@ pub fn execute(
                     &tx,
                     ns,
                     jieba,
-                    &json!({"text":text,"source_id":"preset:wrong_questions","name":"错题集.md","kind":"document"}),
+                    &json!({"text":text,"source_id":"preset:wrong_questions","name":"错题集.md","kind":"document","preset_labels_required":true}),
                 )?;
                 if imported["handled"] != true || imported["error"].is_string() {
                     return Err(crate::error::MemoraError::InvalidState(
@@ -543,7 +551,18 @@ fn record_results(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Val
 
 fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> Result<Value> {
     let raw = body["text"].as_str().unwrap_or("");
-    let text = clean(raw);
+    let annotations=Regex::new(r"<!-- question_tags: (.*?) -->").unwrap();
+    let mut preset_labels=std::collections::HashMap::new();
+    if body["preset_labels_required"]==true {
+        for cap in annotations.captures_iter(raw) {
+            let entry:Value=serde_json::from_str(&cap[1])?;
+            let number=entry["number"].as_i64().ok_or_else(||crate::error::MemoraError::InvalidState("预设标签缺少题号".into()))?;
+            let tags=validated_question_tags(&entry["tags"]).ok_or_else(||crate::error::MemoraError::InvalidState("预设标签无效".into()))?;
+            if preset_labels.insert(number,tags).is_some() {return Err(crate::error::MemoraError::InvalidState("预设标签题号重复".into()));}
+        }
+    }
+    let raw_without_tags=annotations.replace_all(raw,"");
+    let text = clean(&raw_without_tags);
     if !has(&text, &["错题", "古诗词积累练习", "请补全《竹石》"]) {
         return Ok(json!({"handled":false}));
     }
@@ -618,6 +637,12 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
                 raw_q
             );
         }
+        let classification = if body["preset_labels_required"]==true {
+            let tags=preset_labels.get(&number).ok_or_else(||crate::error::MemoraError::InvalidState(format!("预设第{number}题未指定标签")))?;
+            json!({"question_types":tags,"question_label_source":"preset","question_label_reason":null})
+        } else {
+            resolved_question_labels(&body["question_labels"][number.to_string()],raw_q,heading)
+        };
         let a = answer(&q);
         let child = child_answer(&q, heading);
         q = compact_record(&q, &a, &child);
@@ -638,7 +663,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
                 rec.metadata["original_text"] = json!(raw_q);
                 rec.metadata["source_name"] = body["name"].clone();
                 rec.metadata["image"] = json!(image);
-                rec.metadata["question_types"] = json!(labels(raw_q,heading));
+                for key in ["question_types","question_label_source","question_label_reason"] {rec.metadata[key]=classification[key].clone();}
                 rec.metadata["arithmetic_labels_version"] = json!(1);
                 rec.metadata["answer"] = json!(a);
                 rec.metadata["child_answer"] = json!(child);
@@ -650,7 +675,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
             count += 1;
             continue;
         }
-        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":labels(raw_q,heading),"arithmetic_labels_version":1,"answer":a,"child_answer":child,"weight":1.0,"source_id":source,"latest_source_id":source,"latest_upload_id":body["upload_id"].as_str().unwrap_or(source),"source_order":body["source_order"].as_i64().unwrap_or(0),"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":raw_q,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
+        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":classification["question_types"],"question_label_source":classification["question_label_source"],"question_label_reason":classification["question_label_reason"],"arithmetic_labels_version":1,"answer":a,"child_answer":child,"weight":1.0,"source_id":source,"latest_source_id":source,"latest_upload_id":body["upload_id"].as_str().unwrap_or(source),"source_order":body["source_order"].as_i64().unwrap_or(0),"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":raw_q,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
         let id = record(tx, ns, jieba, &owner, &q, meta, None)?;
         ids.push(id);
         count += 1;
@@ -1910,5 +1935,69 @@ mod id_delete_arithmetic_tests {
         assert!(store::get_memory(&conn,Uuid::parse_str(display["id"].as_str().unwrap()).unwrap()).unwrap().is_some());
         let again=e.wrong_practice(json!({"query":"出第1题","session_id":"s","message_id":"m"})).await.unwrap();
         assert!(again["question_id"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod question_label_tests {
+    use super::*;
+    use crate::{MemoryEngine,MemoryUpdate};
+    async fn setup() -> (tempfile::TempDir,MemoryEngine,std::path::PathBuf) {
+        let d=tempfile::tempdir().unwrap();let path=d.path().join("labels.db");
+        let e=MemoryEngine::builder().db_path(&path).build().await.unwrap();(d,e,path)
+    }
+    #[tokio::test]
+    async fn preset_tags_are_authoritative_and_removed_from_fact_body() {
+        let (_d,e,path)=setup().await;
+        let text="错题\n姓名：梁子航\n<!-- question_tags: {\"number\":1,\"tags\":[\"数学题\",\"几何题\"]} -->\n1. 一块面积12平方米的地平均分为3块，每块多大？\n正确答案：4";
+        let r=e.wrong_practice(json!({"action":"import","text":text,"source_id":"preset:test","preset_labels_required":true})).await.unwrap();
+        let conn=Connection::open(&path).unwrap();let q=load(&conn,"default").unwrap();assert_eq!(q.len(),1);
+        assert_eq!(q[0].meta["question_types"],json!(["数学题","几何题"]));assert_eq!(q[0].meta["question_label_source"],"preset");
+        assert!(!q[0].raw.contains("question_tags"));
+        e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
+        assert_eq!(load(&conn,"default").unwrap()[0].meta["question_types"],q[0].meta["question_types"]);
+        assert_eq!(r["count"],1);
+    }
+    #[tokio::test]
+    async fn missing_preset_tags_reject_instead_of_running_rules() {
+        let (_d,e,_path)=setup().await;
+        assert!(e.wrong_practice(json!({"action":"import","text":"错题\n姓名：梁子航\n1. 12÷4是多少？\n正确答案：3","source_id":"preset:test","preset_labels_required":true})).await.is_err());
+        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,0);
+    }
+    #[tokio::test]
+    async fn upload_validates_model_semantics_and_falls_back_for_invalid_question() {
+        let (_d,e,path)=setup().await;
+        let text="错题\n姓名：梁子航\n1. 12÷4是多少？\n正确答案：3\n2. 3×4是多少？\n正确答案：12";
+        e.wrong_practice(json!({"action":"import","text":text,"source_id":"upload:test","question_labels":{
+            "1":{"question_label_source":"edge_model","question_types":["数学题","算术题"]},
+            "2":{"question_label_source":"edge_model","question_types":["数学题","未知标签"]}
+        }})).await.unwrap();
+        let conn=Connection::open(&path).unwrap();let q=load(&conn,"default").unwrap();
+        assert_eq!(q[0].meta["question_types"],json!(["数学题","算术题","除法题","乘除法题"]));assert_eq!(q[0].meta["question_label_source"],"rules_corrected");
+        assert_eq!(q[1].meta["question_label_source"],"rules_fallback");assert!(q[1].meta["question_types"].as_array().unwrap().contains(&json!("乘法题")));
+        e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
+        assert_eq!(load(&conn,"default").unwrap()[0].meta["question_types"],q[0].meta["question_types"]);
+    }
+    #[tokio::test]
+    async fn editing_relabels_without_losing_wrong_question_category_or_creating_graph_jobs() {
+        let (_d,e,path)=setup().await;
+        let imported=e.wrong_practice(json!({"action":"import","text":"错题\n姓名：梁子航\n1. 12÷4是多少？\n正确答案：3","source_id":"upload:test"})).await.unwrap();
+        let id=Uuid::parse_str(imported["ids"][0].as_str().unwrap()).unwrap();
+        let edited="一个正方形边长5厘米，周长多少？\n正确答案：20";
+        e.revise(id,MemoryUpdate {content:Some(edited.into()),metadata:Some(json!({"question_label_source":"edge_model","question_types":["数学题","几何题","乘法题"],"question_label_text":edited})),..Default::default()}).await.unwrap();
+        let conn=Connection::open(&path).unwrap();let rec=store::get_memory(&conn,id).unwrap().unwrap();
+        assert_eq!(rec.tag,"错题集");assert_eq!(rec.metadata["question_label_source"],"edge_model");assert!(!rec.embedding_pending);
+        assert!(rec.metadata["question_types"].as_array().unwrap().contains(&json!("乘除法题")));
+        let jobs:i64=conn.query_row("SELECT COUNT(*) FROM graph_projection_jobs WHERE memory_id=?1",[id.to_string()],|r|r.get(0)).unwrap();assert_eq!(jobs,0);
+        assert_eq!(e.memory_trace(id).await.unwrap().unwrap()["practice_kind"],"question");
+        // 编辑为加法但没有新模型结果，不能沿用上一次乘法分类。
+        e.revise(id,MemoryUpdate {content:Some("7+5是多少？\n正确答案：12".into()),..Default::default()}).await.unwrap();
+        let rec=store::get_memory(&conn,id).unwrap().unwrap();
+        assert_eq!(rec.metadata["question_label_source"],"rules_fallback");
+        let tags=rec.metadata["question_types"].as_array().unwrap();assert!(tags.contains(&json!("加法题")));assert!(!tags.contains(&json!("乘法题")));
+        let revision=rec.revision;
+        e.revise(id,MemoryUpdate {content:Some(rec.content.clone()),metadata:Some(json!({"privacy":true})),..Default::default()}).await.unwrap();
+        assert_eq!(store::get_memory(&conn,id).unwrap().unwrap().metadata["question_types"],rec.metadata["question_types"]);
+        assert!(e.revise(id,MemoryUpdate {content:Some(edited.into()),expected_revision:Some(revision),..Default::default()}).await.is_err());
     }
 }

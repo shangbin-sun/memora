@@ -92,5 +92,7 @@ pub use write_filter::{
 pub mod wrong_practice;
 
 mod simple_preferences;
+mod memory_rules;
+mod question_rules;
 
 mod family_demo;

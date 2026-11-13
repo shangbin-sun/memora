@@ -1,77 +1,12 @@
-//! 明确身份的短句偏好兜底。整句不能安全覆盖时交回端侧抽取。
+//! 明确身份的八类短句事实兜底。整句不能安全覆盖时交回抽取与逐事实规则验证。
 use crate::reconcile::{EvidenceSource, ExtractionProgress, ReconcileReport, ReconcileRequest};
 use crate::{HouseholdMember, ListQuery, MemoryEngine, MemoryService, RememberInput, Result};
 use serde_json::json;
+#[cfg(test)]
 fn fragments(text: &str) -> Option<Vec<String>> {
-    if text.chars().count() > 80
-        || !text.starts_with('我')
-        || [
-            "？",
-            "?",
-            "什么",
-            "吗",
-            "呢",
-            "可能",
-            "也许",
-            "如果",
-            "假如",
-            "以前",
-            "不再",
-            "忘掉",
-            "别记",
-            "不要记",
-            "他说",
-            "她说",
-            "我老婆",
-            "我老公",
-            "我女儿",
-            "我儿子",
-        ]
-        .iter()
-        .any(|w| text.contains(w))
-    {
-        return None;
-    }
-    let mut out: Vec<String> = Vec::new();
-    for part in text
-        .trim_end_matches(['。', '！', '!'])
-        .split(['，', ',', '。', '；', ';'])
-    {
-        let p = part
-            .trim()
-            .trim_start_matches('我')
-            .trim_start_matches('也');
-        if p.is_empty() {
-            continue;
-        }
-        let core = p.trim_start_matches("周末").trim_start_matches("最近");
-        if [
-            "喜欢",
-            "爱",
-            "不喝",
-            "不吃",
-            "不喜欢",
-            "不爱",
-            "讨厌",
-            "迷上了",
-        ]
-        .iter()
-        .any(|v| core.starts_with(v))
-            && core.chars().count() > 2
-        {
-            out.push(p.to_string());
-        } else if !out.is_empty()
-            && (p == "喝了睡不着"
-                || p.starts_with("每天下午")
-                || p.starts_with("每天早上")
-                || p.starts_with("买了一套"))
-        {
-            out.last_mut().unwrap().push_str(&format!("，{}", p));
-        } else {
-            return None;
-        }
-    }
-    (!out.is_empty()).then_some(out)
+    let member=HouseholdMember {member_id:"test".into(),display_name:"测试".into(),role:crate::MemberRole::Other,aliases:vec![],age_band:None};
+    let result=crate::memory_rules::analyze(text,&[member],Some("test"));
+    result.complete.then(||result.facts.into_iter().map(|f|f.content.trim_start_matches("测试").to_owned()).collect())
 }
 pub async fn remember(
     engine: &MemoryEngine,
@@ -81,25 +16,20 @@ pub async fn remember(
 ) -> Result<Option<ReconcileReport>> {
     if sources.len() != 1
         || sources[0].kind != "user_text"
+        || sources[0].truncated
         || sources[0].text.trim() != req.query.trim()
     {
         return Ok(None);
     }
-    let Some(owner) = req.speaker_id.as_deref().and_then(|id| {
-        members
-            .iter()
-            .find(|m| m.member_id == id && id != "主驾" && id != "公共")
-    }) else {
-        return Ok(None);
-    };
-    let Some(parts) = fragments(req.query.trim()) else {
-        return Ok(None);
-    };
+    let analysis=crate::memory_rules::analyze(req.query.trim(),members,req.speaker_id.as_deref());
+    if !analysis.complete { return Ok(None); }
     let mut written = Vec::new();
     let mut facts = Vec::new();
     let mut provenance = Vec::new();
-    for part in parts {
-        let content = format!("{}{}", owner.display_name, part);
+    for fact in analysis.facts {
+        let owner=members.iter().find(|m|m.member_id==fact.owner).expect("rule owner is roster member");
+        let content=fact.content;
+
         let existing = engine
             .list(ListQuery {
                 namespace: req.namespace.clone(),
@@ -117,19 +47,19 @@ pub async fn remember(
             input.namespace = req.namespace.clone();
             input.session_id = req.session_id.clone();
             input.skip_consolidation = true;
-            input.metadata = json!({"skip_graph":true,"rule":"short_preference_v1","source":{"query":req.query,"message_id":req.message_id,"session_id":req.session_id,"speaker_member_id":owner.member_id},"subjects":[{"member_id":owner.member_id,"confidence":1.0}]});
+            input.metadata = crate::household::apply_tag(&json!({"skip_graph":true,"rule":"grounded_fact_rules_v2","source":{"query":fact.evidence,"evidence":fact.evidence,"source_id":sources[0].id,"kind":"user_text","message_id":req.message_id,"session_id":req.session_id,"speaker_member_id":req.speaker_id.as_deref().filter(|id|members.iter().any(|m|m.member_id==*id))},"subjects":[{"member_id":owner.member_id,"confidence":1.0}]}),fact.tag);
             let id = engine.remember(input).await?;
             written.push(id.to_string());
             id
         };
-        facts.push(json!({"owner":owner.member_id,"content":content,"evidence":req.query}));
-        provenance.push(json!({"memory_id":id,"source_id":sources[0].id,"evidence":req.query,"rule":"short_preference_v1"}));
+        facts.push(json!({"owner":owner.member_id,"content":content,"evidence":fact.evidence,"tag":fact.tag}));
+        provenance.push(json!({"memory_id":id,"source_id":sources[0].id,"evidence":fact.evidence,"tag":fact.tag,"rule":"grounded_fact_rules_v2"}));
     }
     Ok(Some(ReconcileReport {
         staged: false,
         skipped: false,
         skip_reason: None,
-        speaker_id: owner.member_id.clone(),
+        speaker_id: req.speaker_id.clone().unwrap_or_default(),
         extract_raw: None,
         registers: 0,
         memories_extracted: facts.len(),

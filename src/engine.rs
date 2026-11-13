@@ -87,6 +87,10 @@ pub struct EngineBuilder {
 }
 
 impl MemoryEngine {
+    pub(crate) fn rule_content_supported(&self,evidence:&str,content:&str,members:&[HouseholdMember])->bool {
+        crate::memory_rules::nouns_supported(&self.inner.jieba,evidence,content,members)
+    }
+
     pub fn builder() -> EngineBuilder {
         EngineBuilder {
             db_path: None,
@@ -2131,6 +2135,8 @@ impl MemoryEngine {
                 "content": record.content,
                 "subject_ids": record.subject_ids,
                 "tag": record.tag,
+                "practice_kind": record.metadata.get("practice_kind"),
+                "revision": record.revision,
                 "session_id": record.session_id,
                 "created_at_ms": record.created_at_ms,
                 "source": record.metadata.get("source"),
@@ -2468,7 +2474,13 @@ impl MemoryEngine {
                         rec.entities = e;
                     }
                     // Preserve validated curated tags and accept explicit reclassification.
-                    if content_changed || rec.tag.trim().is_empty() || update.metadata.is_some() {
+                    if before.tag=="错题集" || before.metadata["practice_kind"]=="question" {
+                        rec.tag="错题集".into();
+                        rec.metadata=household::apply_tag(&rec.metadata,"错题集");
+                        if before.metadata["practice_kind"]=="question" && before.content!=rec.content {
+                            crate::wrong_practice::relabel_edited_question(&mut rec,update.metadata.as_ref());
+                        }
+                    } else if content_changed || rec.tag.trim().is_empty() || update.metadata.is_some() {
                         let ns_tag = rec.namespace.clone();
                         household::ensure_default_tags(&tx, &ns_tag)?;
                         let catalog = household::list_tags(&tx, &ns_tag)?;
@@ -2501,7 +2513,7 @@ impl MemoryEngine {
                         rec.metadata = household::apply_tag(&rec.metadata, &tag);
                     }
                     rec.updated_at_ms = now_ms();
-                    rec.embedding_pending = pending;
+                    rec.embedding_pending = pending && rec.tag!="错题集";
                     rec.embedding_version += 1;
                     delete_embedding(&tx, id)?;
                     update_memory(&tx, &mut rec, jieba.as_ref())?;
@@ -2549,7 +2561,8 @@ impl MemoryEngine {
                             [id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
                         ).optional()?
                     };
-                    let graph_work_queued = graph_inputs_changed || pending_graph_job.is_some();
+                    if rec.tag=="错题集" {crate::graph::store::delete_graph_projection_job_for_memory(&tx,id)?;}
+                    let graph_work_queued = rec.tag!="错题集" && (graph_inputs_changed || pending_graph_job.is_some());
                     let graph_job_revision = rec.revision;
                     if graph_inputs_changed {
                         // Atomic withdrawal: a new worker result cannot be removed by

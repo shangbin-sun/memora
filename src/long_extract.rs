@@ -2344,9 +2344,37 @@ fn edge_reference_history(text: &str, ctx: &ExtractContext) -> String {
     }).map(str::trim).find(|line|!line.is_empty() && *line!=text)
         .map(|line|line.chars().take(80).collect()).unwrap_or_default()
 }
+/// 小模型的对话提示词独立于文档抽取和主聊天模型，few-shot只示范协议和归属。
+fn edge_chat_prompt(source:&EvidenceSource,ctx:&ExtractContext,roster:&Value)->String {
+    let member=roster.as_array().into_iter().flatten().find(|m|m["member_id"].as_str()==Some(ctx.speaker.as_str()));
+    let name=member.and_then(|m|m["display_name"].as_str()).unwrap_or("");
+    let mut examples=String::new();
+    if !ctx.speaker.is_empty() {
+        for (utterance,tag) in [
+            ("我爱吃番茄牛腩","饮食"),("我空闲时会看悬疑电影","娱乐"),
+            ("我的工作是软件测试","工作学习"),("我对磺胺类药过敏","医疗健康"),
+            ("我通勤通常坐公交","出行"),("我习惯晚上23点睡觉","生活习惯"),
+            ("我每月房租2500元","金融"),("我的生日是3月8日","其他"),
+        ] {
+            let content=format!("{}{}",name,utterance.strip_prefix('我').unwrap());
+            examples.push_str(&format!("原文：{utterance}\n输出：{}\n",json!({"records":[{"o":ctx.speaker,"t":tag,"c":content,"e":utterance}],"done":true})));
+        }
+    }
+    let rules=r#"你只提取当前用户原文中的可复用事实，不回答问题。只返回一个JSON对象：{"records":[{"o":"人物ID","t":"标签","c":"事实","e":"原文连续片段"}],"done":true}。无事实返回{"records":[],"done":true}。
+这是人物的记忆，不是实体列表。o是被描述的人；班级、年级、学校、地铁线路、时间、菜名、金额绝不能作为人物。
+身份提供了可靠声纹：原文的我、我的、给我、对我、句子中间的我，都指身份中的speaker.id。第一人称o必须填这个ID，c把我改为speaker.name。明确提到其他人物时用该人的名册ID。未知声纹不能把我猜成任何名册人物；新人物只有明确自报姓名/介绍亲属姓名时才能登记。
+t只能选一个：饮食（食物饮料、口味、不吃不喝）；娱乐（玩具、影音、爱好）；工作学习（职业、学校、年级班级、课程专业）；医疗健康（疾病、诊断、过敏、用药）；出行（交通、通勤、旅游、驾驶证）；生活习惯（作息、睡眠、运动、家务）；金融（收入、花费、房租、预算）；其他（生日、住址、亲属关系）。
+e逐字引用当前用户原文，不重排词语，不引用例子/系统/历史；c保留否定、时间、数值、单位和计划状态，不把未确诊变确诊、不把不吃说成过敏。每条独立事实一条record。
+问句、建议、如果/假设、可能/也许、虚构引述、禁止保存、密码验证码均不记。问句中另有明确陈述时只记陈述部分。例子不是用户事实，只示范格式。仅用户明确要求遗忘可用k=f，普通事实不要输出注册或遗忘操作。"#;
+    let context=json!({"speaker":{"id":ctx.speaker,"name":name},"members":roster,"message_at_ms":ctx.message_at_ms,"history_names_only":edge_reference_history(&source.text,ctx)});
+    format!("{rules}\n身份：{context}\n以下仅为示例：\n{examples}原文：如果我拿到奖金就去旅行\n输出：{{\"records\":[],\"done\":true}}\n现在仅处理下一条用户原文。")
+}
+
 fn edge_extraction_prompt(source: &EvidenceSource, ctx: &ExtractContext, root: &str, start: usize) -> String {
     let is_chat=source.kind=="user_text";
     let roster: Value=serde_json::from_str(&ctx.roster).unwrap_or(json!([]));
+    if is_chat {return edge_chat_prompt(source,ctx,&roster);}
+
     let person_context=edge_person_context(root,start);
     let context_people=crate::edge_table::referenced_ids(root,&person_context,&ctx.roster);
     let document_subject=if let Some(name)=person_context.strip_prefix("姓名：") {
