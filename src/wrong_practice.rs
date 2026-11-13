@@ -370,6 +370,8 @@ pub fn execute(
             }
         }
         seeded
+    } else if body["action"] == "record_results" {
+        record_results(&tx, ns, jieba, &body)?
     } else if body["action"] == "family_recall" {
         crate::family_demo::recall(&tx, ns, &body)?
     } else if body["action"] == "import" {
@@ -381,6 +383,38 @@ pub fn execute(
     result["elapsed_ms"] = json!(start.elapsed().as_secs_f64() * 1000.0);
     Ok(result)
 }
+/// 宿主工具写入已判定结果，不重新抽取、判题或拆分正文。
+fn record_results(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> Result<Value> {
+    let invalid = |message: &str| crate::error::MemoraError::InvalidState(message.into());
+    let rows = body["list"].as_array().filter(|v| !v.is_empty()).ok_or_else(|| invalid("list必须为非空数组"))?;
+    let mut lines = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let fields = row.as_object().ok_or_else(|| invalid("题目项必须为对象"))?;
+        if fields.len() != 2 { return Err(invalid("每项只接受题目、是否答对两个字段")); }
+        let question = row["题目"].as_str().filter(|v| !v.trim().is_empty()).ok_or_else(|| invalid("题目必须为非空字符串"))?;
+        let correct = row["是否答对"].as_bool().ok_or_else(|| invalid("是否答对必须为布尔值"))?;
+        let prefix = if rows.len() == 1 { String::new() } else { format!("{}.", i + 1) };
+        lines.push(format!("{prefix}{question} **{}**", if correct { "答对" } else { "答错" }));
+    }
+    let members = household::list_members(tx, ns)?;
+    let owners: Vec<_> = members.iter().filter(|m| m.display_name == "梁子航").collect();
+    if owners.len() > 1 { return Err(invalid("梁子航存在多个同名成员，未保存")); }
+    let owner = owners.first().map(|m| m.member_id.clone()).unwrap_or_else(|| format!("person_{}", Uuid::now_v7()));
+    if owners.is_empty() {
+        household::upsert_member(tx, ns, &household::HouseholdMember {
+            member_id: owner.clone(), display_name: "梁子航".into(), role: household::MemberRole::Child,
+            aliases: vec![], age_band: None,
+        })?;
+    }
+    household::upsert_tag(tx, ns, &household::MemoryTag {tag_id: "错题集".into(), display_name: "错题集".into(), aliases: vec![]})?;
+    let content = lines.join("\n");
+    let id = record(tx, ns, jieba, &owner, &content, json!({
+        "record_type":"practice_results", "source":"incorrect_question_record", "owner_name":"梁子航",
+        "subjects":[{"member_id":owner,"confidence":1.0}], "attribution":"manual", "results":rows
+    }), None)?;
+    Ok(json!({"ok":true,"id":id,"content":content,"count":rows.len()}))
+}
+
 fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> Result<Value> {
     let raw = body["text"].as_str().unwrap_or("");
     let text = clean(raw);
@@ -1447,5 +1481,49 @@ mod ocr_mark_regressions {
             record.content
         );
         assert!(!record.content.starts_with("1."));
+    }
+}
+
+#[cfg(test)]
+mod record_results_tests {
+    use super::*;
+    use crate::MemoryEngine;
+
+    #[tokio::test]
+    async fn record_results_preserves_format_owner_and_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("results.db");
+        let e = MemoryEngine::builder().db_path(&path).build().await.unwrap();
+        for (rows, expected) in [
+            (json!([{"题目":"1+1=?","是否答对":true}]), "1+1=? **答对**"),
+            (json!([{"题目":"甲题","是否答对":true},{"题目":"乙题\n第二行","是否答对":false}]), "1.甲题 **答对**\n2.乙题\n第二行 **答错**"),
+        ] {
+            let result = e.wrong_practice(json!({"action":"record_results","list":rows})).await.unwrap();
+            assert_eq!(result["content"], expected);
+            let id = Uuid::parse_str(result["id"].as_str().unwrap()).unwrap();
+            let conn = Connection::open(&path).unwrap();
+            let fact = store::get_memory(&conn, id).unwrap().unwrap();
+            assert_eq!(fact.content, expected);
+            assert_eq!(fact.tag, "错题集");
+            assert!(!fact.embedding_pending && !fact.consolidation_pending);
+            assert_eq!(fact.metadata["record_type"], "practice_results");
+            let members = household::list_members(&conn, "default").unwrap();
+            let owner = members.iter().find(|m| m.display_name == "梁子航").unwrap();
+            assert_eq!(fact.subject_ids, vec![owner.member_id.clone()]);
+        }
+        let facts = e.list(ListQuery::default()).await.unwrap();
+        assert_eq!(facts.total, 2);
+    }
+
+    #[tokio::test]
+    async fn record_results_rejects_invalid_batch_without_partial_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MemoryEngine::builder().db_path(dir.path().join("invalid.db")).build().await.unwrap();
+        for rows in [json!([]), json!([{"题目":"甲","是否答对":"true"}]),
+            json!([{"题目":"甲","是否答对":true},{"题目":" ","是否答对":false}]),
+            json!([{"题目":42,"是否答对":true}]), json!([{"题目":"甲","是否答对":true,"其他":1}])] {
+            assert!(e.wrong_practice(json!({"action":"record_results","list":rows})).await.is_err());
+        }
+        assert_eq!(e.list(ListQuery::default()).await.unwrap().total, 0);
     }
 }
