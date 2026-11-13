@@ -618,6 +618,10 @@ pub fn update_memory(conn: &Connection, rec: &mut MemoryRecord, jieba: &Jieba) -
 /// Archived atoms supporting a summary remain directly searchable. Ordinary
 /// low-value archives, forgotten and superseded rows are still excluded.
 pub fn memory_is_recallable(rec: &MemoryRecord) -> bool {
+    // 兼容已落库的旧工具记录；仅展示事实仍可由list供UI读取。
+    if rec.metadata["display_only"] == true || rec.metadata["record_type"] == "practice_results" {
+        return false;
+    }
     rec.state == MemoryState::Active
         || (rec.state == MemoryState::Archived
             && rec

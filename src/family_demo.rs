@@ -84,7 +84,7 @@ pub fn seed(conn: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) 
             confidence: 1.0,
             salience: 0.8,
             created_at_ms: now,
-            updated_at_ms: now,
+            updated_at_ms: if f["ui_latest"] == true { now + 1 } else { now },
             last_accessed_at_ms: None,
             next_review_at_ms: None,
             review_count: 0,

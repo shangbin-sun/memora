@@ -318,7 +318,7 @@ fn load(conn: &Connection, ns: &str) -> Result<Vec<Q>> {
     for row in rows {
         let (id, raw, m) = row?;
         let meta: Value = serde_json::from_str(&m)?;
-        if meta["practice_kind"] == "question" {
+        if meta["practice_kind"] == "question" && meta["display_only"] != true && meta["record_type"] != "practice_results" {
             out.push(Q {
                 id,
                 number: meta["number"].as_i64().unwrap_or(0),
@@ -370,6 +370,10 @@ pub fn execute(
             }
         }
         seeded
+    } else if body["action"] == "latest_uploaded_questions" {
+        latest_uploaded_questions(&tx, ns, &body)?
+    } else if body["action"] == "latest_health_memory" {
+        latest_health_memory(&tx, ns, &body)?
     } else if body["action"] == "record_results" {
         record_results(&tx, ns, jieba, &body)?
     } else if body["action"] == "family_recall" {
@@ -383,9 +387,64 @@ pub fn execute(
     result["elapsed_ms"] = json!(start.elapsed().as_secs_f64() * 1000.0);
     Ok(result)
 }
+fn required_person_name(body: &Value) -> Result<&str> {
+    let name = body["name"].as_str().map(str::trim).filter(|n| !n.is_empty() && n.chars().count() <= 40 && !n.chars().any(char::is_control));
+    name.ok_or_else(|| crate::error::MemoraError::InvalidState("name必须为1至40字的有效人物姓名字符串".into()))
+}
+
+fn person_owner(conn: &Connection, ns: &str, name: &str) -> Result<Option<String>> {
+    let members = household::list_members(conn, ns)?;
+    // 正式姓名优先；没有正式姓名匹配时才接受唯一别名，不做跨人的模糊匹配。
+    let exact: Vec<_> = members.iter().filter(|m| m.display_name == name).collect();
+    let owners = if exact.is_empty() { members.iter().filter(|m| m.aliases.iter().any(|a| a == name)).collect() } else { exact };
+    if owners.len() > 1 {
+        return Err(crate::error::MemoraError::InvalidState(format!("{name}匹配多个成员，无法确定归属")));
+    }
+    Ok(owners.first().map(|m| m.member_id.clone()))
+}
+
+fn latest_uploaded_questions(conn: &Connection, ns: &str, body: &Value) -> Result<Value> {
+    let name = required_person_name(body)?;
+    let Some(owner) = person_owner(conn, ns, name)? else { return Ok(json!({"ok":false,"error":format!("未找到{name}最近上传的错题")})); };
+    let all = load(conn, ns)?;
+    let source_of = |q: &Q| q.meta["latest_source_id"].as_str().or(q.meta["source_id"].as_str()).unwrap_or("").to_string();
+    let upload_of = |q: &Q| q.meta["latest_upload_id"].as_str().map(str::to_string).unwrap_or_else(|| source_of(q));
+    let mut questions: Vec<_> = all.iter().filter(|q| q.meta["subjects"][0]["member_id"] == owner && !household::is_privacy(&q.meta)
+        && !source_of(q).is_empty() && !source_of(q).starts_with("preset:")).collect();
+    questions.sort_by_key(|q| (q.meta["uploaded_at_ms"].as_i64().unwrap_or(0), q.id.clone()));
+    let Some(latest) = questions.last() else { return Ok(json!({"ok":false,"error":format!("未找到{name}最近上传的错题")})); };
+    let upload = upload_of(latest);
+    questions.retain(|q| upload_of(q) == upload);
+    questions.sort_by_key(|q| (q.meta["source_order"].as_i64().unwrap_or(0),q.number,q.id.clone()));
+    // 原文是记忆事实正文：保持每条content逐字不变，仅以换行连接多条事实。
+    let contents: Vec<_> = questions.iter().map(|q| q.raw.as_str()).collect();
+    Ok(json!({"ok":true,"content":contents.join("\n"),"upload_id":upload}))
+}
+
+fn latest_health_memory(conn: &Connection, ns: &str, body: &Value) -> Result<Value> {
+    let name = required_person_name(body)?;
+    let Some(owner) = person_owner(conn, ns, name)? else { return Ok(json!({"ok":false,"error":format!("未找到{name}的医疗健康记忆")})); };
+    // 与UI事实列表使用相同的最新排序，排除摘要、规律及隐藏项。
+    let mut stmt = conn.prepare("SELECT id FROM memories WHERE namespace=?1 AND tag='医疗健康' AND (state='active' OR (state='archived' AND json_extract(metadata_json,'$.recall_archived')=1)) AND kind NOT IN ('summary','pattern') ORDER BY updated_at_ms DESC,id DESC")?;
+    let ids = stmt.query_map([ns], |r| r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let members = household::list_members(conn, ns)?;
+    let display_name = members.iter().find(|m| m.member_id == owner).map(|m| m.display_name.as_str()).unwrap_or(name);
+    for id in ids {
+        let id = Uuid::parse_str(&id).map_err(|e| crate::error::MemoraError::InvalidState(e.to_string()))?;
+        let Some(rec) = store::get_memory(conn, id)? else { continue; };
+        if !rec.subject_ids.contains(&owner) || household::is_privacy(&rec.metadata) || rec.metadata["display_only"] == true || rec.metadata["record_type"] == "practice_results" { continue; }
+        if rec.content.trim().is_empty() || (rec.metadata["dream"] == true && rec.metadata["support_count"].as_i64().unwrap_or(0) > 0) { continue; }
+        let has_person = members.iter().any(|m| rec.content.contains(&m.display_name) || m.aliases.iter().any(|a| a.chars().count() >= 2 && rec.content.contains(a)));
+        let content = if has_person { rec.content } else { format!("{display_name}{}",rec.content) };
+        return Ok(json!({"ok":true,"content":content,"id":id}));
+    }
+    Ok(json!({"ok":false,"error":format!("未找到{name}的医疗健康记忆")}))
+}
+
 /// 宿主工具写入已判定结果，不重新抽取、判题或拆分正文。
 fn record_results(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> Result<Value> {
     let invalid = |message: &str| crate::error::MemoraError::InvalidState(message.into());
+    let name = required_person_name(body)?;
     let rows = body["list"].as_array().filter(|v| !v.is_empty()).ok_or_else(|| invalid("list必须为非空数组"))?;
     let mut lines = Vec::new();
     for (i, row) in rows.iter().enumerate() {
@@ -396,20 +455,18 @@ fn record_results(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Val
         let prefix = if rows.len() == 1 { String::new() } else { format!("{}.", i + 1) };
         lines.push(format!("{prefix}{question} **{}**", if correct { "答对" } else { "答错" }));
     }
-    let members = household::list_members(tx, ns)?;
-    let owners: Vec<_> = members.iter().filter(|m| m.display_name == "梁子航").collect();
-    if owners.len() > 1 { return Err(invalid("梁子航存在多个同名成员，未保存")); }
-    let owner = owners.first().map(|m| m.member_id.clone()).unwrap_or_else(|| format!("person_{}", Uuid::now_v7()));
-    if owners.is_empty() {
+    let existing = person_owner(tx, ns, name)?;
+    let owner = existing.clone().unwrap_or_else(|| format!("person_{}", Uuid::now_v7()));
+    if existing.is_none() {
         household::upsert_member(tx, ns, &household::HouseholdMember {
-            member_id: owner.clone(), display_name: "梁子航".into(), role: household::MemberRole::Child,
+            member_id: owner.clone(), display_name: name.into(), role: household::MemberRole::Other,
             aliases: vec![], age_band: None,
         })?;
     }
     household::upsert_tag(tx, ns, &household::MemoryTag {tag_id: "错题集".into(), display_name: "错题集".into(), aliases: vec![]})?;
     let content = lines.join("\n");
     let id = record(tx, ns, jieba, &owner, &content, json!({
-        "record_type":"practice_results", "source":"incorrect_question_record", "owner_name":"梁子航",
+        "record_type":"practice_results", "display_only":true, "source":"person_incorrect_question_record", "owner_name":name,
         "subjects":[{"member_id":owner,"confidence":1.0}], "attribution":"manual", "results":rows
     }), None)?;
     Ok(json!({"ok":true,"id":id,"content":content,"count":rows.len()}))
@@ -506,6 +563,8 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
                 rec.metadata["uploaded_at_ms"] =
                     json!(body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms));
                 rec.metadata["latest_source_id"] = json!(source);
+                rec.metadata["latest_upload_id"] = json!(body["upload_id"].as_str().unwrap_or(source));
+                rec.metadata["source_order"] = json!(body["source_order"].as_i64().unwrap_or(0));
                 rec.metadata["previous_original_text"] = rec.metadata["original_text"].clone();
                 rec.metadata["original_text"] = json!(raw_q);
                 rec.metadata["source_name"] = body["name"].clone();
@@ -520,7 +579,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
             count += 1;
             continue;
         }
-        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":labels(&q,heading),"answer":a,"child_answer":child,"weight":1.0,"source_id":source,"latest_source_id":source,"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":raw_q,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
+        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":labels(&q,heading),"answer":a,"child_answer":child,"weight":1.0,"source_id":source,"latest_source_id":source,"latest_upload_id":body["upload_id"].as_str().unwrap_or(source),"source_order":body["source_order"].as_i64().unwrap_or(0),"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":raw_q,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
         let id = record(tx, ns, jieba, &owner, &q, meta, None)?;
         ids.push(id);
         count += 1;
@@ -1498,7 +1557,7 @@ mod record_results_tests {
             (json!([{"题目":"1+1=?","是否答对":true}]), "1+1=? **答对**"),
             (json!([{"题目":"甲题","是否答对":true},{"题目":"乙题\n第二行","是否答对":false}]), "1.甲题 **答对**\n2.乙题\n第二行 **答错**"),
         ] {
-            let result = e.wrong_practice(json!({"action":"record_results","list":rows})).await.unwrap();
+            let result = e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":rows})).await.unwrap();
             assert_eq!(result["content"], expected);
             let id = Uuid::parse_str(result["id"].as_str().unwrap()).unwrap();
             let conn = Connection::open(&path).unwrap();
@@ -1522,8 +1581,145 @@ mod record_results_tests {
         for rows in [json!([]), json!([{"题目":"甲","是否答对":"true"}]),
             json!([{"题目":"甲","是否答对":true},{"题目":" ","是否答对":false}]),
             json!([{"题目":42,"是否答对":true}]), json!([{"题目":"甲","是否答对":true,"其他":1}])] {
-            assert!(e.wrong_practice(json!({"action":"record_results","list":rows})).await.is_err());
+            assert!(e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":rows})).await.is_err());
         }
         assert_eq!(e.list(ListQuery::default()).await.unwrap().total, 0);
+    }
+}
+
+#[cfg(test)]
+mod latest_memory_tools_tests {
+    use super::*;
+    use crate::{MemoryEngine, RecallQuery};
+
+    async fn engine() -> (tempfile::TempDir, MemoryEngine, std::path::PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("m.db");
+        let e = MemoryEngine::builder().db_path(&path).build().await.unwrap();
+        (d,e,path)
+    }
+    async fn upload(e: &MemoryEngine, source: &str, group: &str, order: i64, at: i64, text: &str) {
+        let r = e.wrong_practice(json!({"action":"import","source_id":source,"upload_id":group,"source_order":order,"uploaded_at_ms":at,"text":text,"kind":"document"})).await.unwrap();
+        assert!(r["count"].as_i64().unwrap_or(0) > 0, "{r}");
+    }
+    #[tokio::test]
+    async fn display_results_stay_in_ui_but_never_enter_any_recall_or_latest_upload() {
+        let (_d,e,path) = engine().await;
+        let r = e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":[{"题目":"独特展示词紫色河马","是否答对":true}]})).await.unwrap();
+        let conn = Connection::open(path).unwrap();
+        let rec = store::get_memory(&conn,Uuid::parse_str(r["id"].as_str().unwrap()).unwrap()).unwrap().unwrap();
+        assert_eq!(rec.metadata["display_only"], true);
+        assert!(!store::memory_is_recallable(&rec));
+        let mut legacy = rec.clone();
+        legacy.metadata.as_object_mut().unwrap().remove("display_only");
+        assert!(!store::memory_is_recallable(&legacy));
+        let page = e.list(ListQuery {facts_only:true,..Default::default()}).await.unwrap();
+        assert_eq!(page.total,1);
+        assert!(load(&conn,"default").unwrap().is_empty());
+        assert!(e.recall(RecallQuery {text:"紫色河马".into(),fts_only:true,..Default::default()}).await.unwrap().hits.is_empty());
+        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap()["ok"],false);
+    }
+    #[tokio::test]
+    async fn latest_upload_returns_fact_content_and_all_pages_excludes_other_owners_and_presets() {
+        let (_d,e,path) = engine().await;
+        upload(&e,"old","old",0,1,"错题\n姓名：梁子航\n1. 旧题 **原样**\n正确答案：A").await;
+        let page1 = "# 错题\r\n姓名：梁子航\r\n1. 甲题 **原样**\r\n正确答案：B\r\n";
+        let page2 = "错题\n姓名：梁子航\n2. 乙题\n正确答案：C\n";
+        upload(&e,"new:1","new",0,20,page1).await;
+        upload(&e,"new:2","new",1,20,page2).await;
+        upload(&e,"someone","someone",0,999,"错题\n姓名：宋娜娜\n1. 别人的题\n正确答案：D").await;
+        upload(&e,"preset:wrong_questions","preset",0,1000,"错题\n姓名：梁子航\n3. 预设题\n正确答案：A").await;
+        let r=e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let mut facts = load(&conn,"default").unwrap().into_iter().filter(|q| q.meta["latest_upload_id"] == "new").collect::<Vec<_>>();
+        facts.sort_by_key(|q| (q.meta["source_order"].as_i64().unwrap(), q.number));
+        let expected = facts.iter().map(|q|q.raw.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(r["content"],expected);
+        assert_ne!(expected,format!("{page1}\n{page2}"));
+        e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":[{"题目":"更晚的展示题","是否答对":false}]})).await.unwrap();
+        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap()["content"],r["content"]);
+    }
+    #[tokio::test]
+    async fn legacy_upload_uses_fact_content_and_hidden_or_deleted_sources_are_not_exposed() {
+        let (_d,e,path)=engine().await;
+        let raw="错题\n姓名：梁子航\n1. 古诗 **原样**\n正确答案：A";
+        upload(&e,"legacy","legacy",0,1,raw).await;
+        let conn=Connection::open(path).unwrap();
+        conn.execute("UPDATE memories SET metadata_json=json_remove(metadata_json,'$.latest_upload_id','$.source_order')",[]).unwrap();
+        let r=e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
+        assert_eq!(r["content"],load(&conn,"default").unwrap()[0].raw);
+        conn.execute("UPDATE memories SET metadata_json=json_set(metadata_json,'$.privacy',json('true'))",[]).unwrap();
+        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap()["ok"],false);
+        conn.execute("DELETE FROM memories",[]).unwrap();
+        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap()["ok"],false);
+    }
+    fn health(content: &str, latest: bool) -> Value {
+        json!({"owner":"child","content":content,"tag":"医疗健康","domain":"medical","source":"用户指定","keywords":["发烧"],"entity_type":"concept","entity_name":"健康状态","relation":"近期健康","ui_latest":latest})
+    }
+    #[tokio::test]
+    async fn newest_health_matches_ui_order_and_only_adds_missing_person() {
+        let (_d,e,path)=engine().await;
+        let mut data=json!({"version":1,"members":[{"id":"child","name":"梁子航","role":"child","aliases":["航航"]}],"facts":[health("最近正在发烧。",true),health("梁子航对花生过敏。",false)]});
+        e.wrong_practice(json!({"action":"family_seed","data":data})).await.unwrap();
+        let r=e.wrong_practice(json!({"action":"latest_health_memory","name":"梁子航"})).await.unwrap();
+        assert_eq!(r["content"],"梁子航最近正在发烧。");
+        let page=e.list(ListQuery {member_id:Some("child".into()),tag:Some("医疗健康".into()),facts_only:true,..Default::default()}).await.unwrap();
+        assert_eq!(page.items[0].content,"最近正在发烧。");
+        for text in ["梁子航最近正在发烧。","航航最近正在发烧。"] {
+            data["version"]=json!(data["version"].as_i64().unwrap()+1);
+            data["facts"][0]["content"]=json!(text);
+            e.wrong_practice(json!({"action":"family_seed","data":data})).await.unwrap();
+            assert_eq!(e.wrong_practice(json!({"action":"latest_health_memory","name":"梁子航"})).await.unwrap()["content"],text);
+        }
+        let conn=Connection::open(path).unwrap();
+        conn.execute("UPDATE memories SET metadata_json=json_set(metadata_json,'$.privacy',json('true'))",[]).unwrap();
+        assert_eq!(e.wrong_practice(json!({"action":"latest_health_memory","name":"梁子航"})).await.unwrap()["ok"],false);
+    }
+}
+
+#[cfg(test)]
+mod named_memory_tools_tests {
+    use super::*;
+    use crate::MemoryEngine;
+
+    #[tokio::test]
+    async fn all_three_actions_require_real_string_name_and_reads_do_not_create_people() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("named.db");
+        let e=MemoryEngine::builder().db_path(&path).build().await.unwrap();
+        for action in ["latest_uploaded_questions","latest_health_memory"] {
+            assert_eq!(e.wrong_practice(json!({"action":action,"name":"梁子航"})).await.unwrap()["ok"],false);
+        }
+        let conn=Connection::open(&path).unwrap();
+        assert!(household::list_members(&conn,"default").unwrap().is_empty());
+        let rows=json!([{"题目":"甲题","是否答对":true}]);
+        e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":rows})).await.unwrap();
+        for action in ["record_results","latest_uploaded_questions","latest_health_memory"] {
+            for name in [Value::Null,json!(1),json!(true),json!(" "),json!("梁\n子航")] {
+                assert!(e.wrong_practice(json!({"action":action,"name":name,"list":rows})).await.is_err());
+            }
+            assert!(e.wrong_practice(json!({"action":action,"list":rows})).await.is_err());
+        }
+        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,1);
+    }
+
+    #[tokio::test]
+    async fn liang_alias_reuses_owner_and_health_uses_canonical_name() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("alias.db");
+        let e=MemoryEngine::builder().db_path(&path).build().await.unwrap();
+        let data=json!({"version":1,"members":[{"id":"child","name":"梁子航","role":"child","aliases":["航航"]}],"facts":[{"owner":"child","content":"最近正在发烧。","tag":"医疗健康","domain":"medical","source":"用户指定","keywords":["发烧"],"entity_type":"concept","entity_name":"发烧","relation":"近期健康状态","ui_latest":true}]});
+        e.wrong_practice(json!({"action":"family_seed","data":data})).await.unwrap();
+        assert_eq!(e.wrong_practice(json!({"action":"latest_health_memory","name":"航航"})).await.unwrap()["content"],"梁子航最近正在发烧。");
+        let result=e.wrong_practice(json!({"action":"record_results","name":"航航","list":[{"题目":"甲题","是否答对":false}]})).await.unwrap();
+        let conn=Connection::open(&path).unwrap();
+        let rec=store::get_memory(&conn,Uuid::parse_str(result["id"].as_str().unwrap()).unwrap()).unwrap().unwrap();
+        assert_eq!(rec.subject_ids,vec!["child"]);
+        assert_eq!(household::list_members(&conn,"default").unwrap().len(),1);
+        // 正式姓名冲突必须拒绝；不能任选一人，也不能悄悄创建第三个人。
+        household::upsert_member(&conn,"default",&household::HouseholdMember {member_id:"duplicate".into(),display_name:"梁子航".into(),role:household::MemberRole::Other,aliases:vec![],age_band:None}).unwrap();
+        for action in ["record_results","latest_uploaded_questions","latest_health_memory"] {
+            assert!(e.wrong_practice(json!({"action":action,"name":"梁子航","list":[{"题目":"甲题","是否答对":true}]})).await.is_err());
+        }
     }
 }
