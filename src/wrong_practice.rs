@@ -612,6 +612,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
     }
     let existing = load(tx, ns)?;
     let mut count = 0;
+    let mut skipped_correct = 0;
     let mut ids = Vec::new();
     for (i, c) in matches.iter().enumerate() {
         let number: i64 = c[1].parse().unwrap_or(0);
@@ -637,26 +638,36 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
                 raw_q
             );
         }
-        let classification = if body["preset_labels_required"]==true {
+        let mut classification = if body["preset_labels_required"]==true {
             let tags=preset_labels.get(&number).ok_or_else(||crate::error::MemoraError::InvalidState(format!("预设第{number}题未指定标签")))?;
             json!({"question_types":tags,"question_label_source":"preset","question_label_reason":null})
         } else {
             resolved_question_labels(&body["question_labels"][number.to_string()],raw_q,heading)
         };
-        // 图片类型已由OCR判断；专用转录通道不生成标准答案或解析。
-        let transcription = if image && text.starts_with("# 错题原文（仅转录）") {
-            Some(Regex::new(r"^\d+[.．、。]\s*(\d+[+\-×÷]\d+=\d+)\s+答错$").unwrap()
-                .captures(raw_q)
-                .ok_or_else(|| crate::error::MemoraError::InvalidState("错题算式转录不完整".into()))?[1].to_string())
-        } else { None };
-        let a = if transcription.is_some() { String::new() } else { answer(&q) };
-        let child = if let Some(equation) = &transcription {
-            equation.rsplit('=').next().unwrap_or("").to_string()
-        } else { child_answer(&q, heading) };
-        q = if let Some(equation) = transcription { format!("{equation} 答错") } else { compact_record(&q, &a, &child) };
+        // 只把程序证实答错的有效表达式保存为错题，OCR批改结论不作为判题依据。
+        let equation = Regex::new(r"^\d+[.．、。]\s*").unwrap().replace(raw_q, "");
+        let equation = equation.trim().strip_suffix("答错").unwrap_or(equation.trim()).trim();
+        let calculated = crate::arithmetic::check(equation);
+        if image && text.starts_with("# 错题原文（仅转录）") && calculated.is_none() {
+            return Err(crate::error::MemoraError::InvalidState("数学表达式无效、超出支持范围或无法安全计算".into()));
+        }
+        if calculated.as_ref().is_some_and(|checked| checked.correct) {
+            skipped_correct += 1;
+            continue;
+        }
+        let (a, child) = if let Some(checked) = &calculated {
+            classification = json!({"question_types":checked.tags,"question_label_source":"program","question_label_reason":"parsed_arithmetic_expression"});
+            q = format!("{} {}\n**孩子答案：{}　正确答案：{}**", checked.question_type, checked.expression, checked.child_answer, checked.correct_answer);
+            (checked.correct_answer.clone(), checked.child_answer.clone())
+        } else {
+            let a = answer(&q); let child = child_answer(&q, heading);
+            q = compact_record(&q, &a, &child);
+            (a, child)
+        };
         if let Some(old) = existing.iter().find(|old| {
             old.number == number
-                && (old.meta["source_id"] == source || question_key(&old.raw) == question_key(&q))
+                && (old.meta["source_id"] == source || question_key(&old.raw) == question_key(&q)
+                    || (calculated.is_some() && old.meta["image"] == true && old.meta["original_text"].as_str() == Some(raw_q)))
                 && old.meta["subjects"][0]["member_id"] == owner
         }) {
             let id = Uuid::parse_str(&old.id)
@@ -688,7 +699,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         ids.push(id);
         count += 1;
     }
-    Ok(json!({"handled":true,"count":count,"ids":ids,"owner":name}))
+    Ok(json!({"handled":true,"count":count,"ids":ids,"owner":name,"skipped_correct":skipped_correct}))
 }
 fn query_types(q: &str) -> Vec<&'static str> {
     let mut types = Vec::new();
@@ -2007,5 +2018,49 @@ mod question_label_tests {
         e.revise(id,MemoryUpdate {content:Some(rec.content.clone()),metadata:Some(json!({"privacy":true})),..Default::default()}).await.unwrap();
         assert_eq!(store::get_memory(&conn,id).unwrap().unwrap().metadata["question_types"],rec.metadata["question_types"]);
         assert!(e.revise(id,MemoryUpdate {content:Some(edited.into()),expected_revision:Some(revision),..Default::default()}).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod calculated_math_tests {
+    use super::*;
+    use crate::MemoryEngine;
+    async fn engine() -> (tempfile::TempDir, MemoryEngine) {
+        let dir=tempfile::tempdir().unwrap();
+        let engine=MemoryEngine::builder().db_path(dir.path().join("math.db")).build().await.unwrap();
+        (dir,engine)
+    }
+    fn input(equation: &str, source: &str)->Value {
+        json!({"action":"import","text":format!("# 错题原文（仅转录）\n归属：梁子航\n1.{equation} 答错"),"source_id":source,"kind":"image_ocr",
+            "question_labels":{"1":{"question_types":["数学题","除法题"],"question_label_source":"edge_model"}}})
+    }
+    #[tokio::test] async fn program_supplies_answer_type_and_preset_format_without_explanation() {
+        let (_dir,e)=engine().await;
+        let result=e.wrong_practice(input("2×2=40","a")).await.unwrap();assert_eq!(result["count"],1);
+        let page=e.list(ListQuery{tag:Some("错题集".into()),..Default::default()}).await.unwrap();
+        let item=&page.items[0];assert_eq!(item.content,"乘法题 2×2\n**孩子答案：40　正确答案：4**");
+        assert_eq!(item.metadata["answer"],"4");assert_eq!(item.metadata["child_answer"],"40");
+        assert_eq!(item.metadata["question_label_source"],"program");
+        assert!(item.metadata["question_types"].as_array().unwrap().contains(&json!("乘法题")));
+        assert!(!item.metadata["question_types"].as_array().unwrap().contains(&json!("除法题")));
+        assert!(!item.content.contains("解析"));assert!(!item.embedding_pending);
+        // 原始转录一致时，旧格式条目应原地更新，跨上传不新增重复题。
+        e.revise(item.id,MemoryUpdate{content:Some("2×2=40 答错".into()),..Default::default()}).await.unwrap();
+        let next=e.wrong_practice(input("2×2=40","b")).await.unwrap();assert_eq!(result["ids"],next["ids"]);
+        let page=e.list(ListQuery::default()).await.unwrap();assert_eq!(page.total,1);
+        assert_eq!(page.items[0].content,"乘法题 2×2\n**孩子答案：40　正确答案：4**");
+    }
+    #[tokio::test] async fn correct_answers_are_not_stored_even_when_ocr_says_wrong() {
+        let (_dir,e)=engine().await;
+        for text in ["2×2=4","0.1+0.2=0.3","1÷2=0.5","(2+3)×4=20"] {
+            let r=e.wrong_practice(input(text,text)).await.unwrap();
+            assert_eq!(r["count"],0);assert_eq!(r["skipped_correct"],1);assert_eq!(r["ids"],json!([]));
+        }
+        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,0);
+    }
+    #[tokio::test] async fn invalid_arithmetic_never_creates_a_question() {
+        let (_dir,e)=engine().await;
+        for text in ["2×=40","1÷0=0","2^999999=0"] {assert!(e.wrong_practice(input(text,text)).await.is_err());}
+        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,0);
     }
 }
