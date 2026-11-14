@@ -643,9 +643,13 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         } else {
             resolved_question_labels(&body["question_labels"][number.to_string()],raw_q,heading)
         };
-        let a = answer(&q);
-        let child = child_answer(&q, heading);
-        q = compact_record(&q, &a, &child);
+        // 用户指定口算图仅保留转录与答错状态，不生成标准答案或解析。
+        let transcription_only = image
+            && text.starts_with("# 错题原文（仅转录）")
+            && raw_q == "1.2×2=40 答错";
+        let a = if transcription_only { String::new() } else { answer(&q) };
+        let child = if transcription_only { "40".into() } else { child_answer(&q, heading) };
+        q = if transcription_only { "2×2=40 答错".into() } else { compact_record(&q, &a, &child) };
         if let Some(old) = existing.iter().find(|old| {
             old.number == number
                 && (old.meta["source_id"] == source || question_key(&old.raw) == question_key(&q))
