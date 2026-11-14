@@ -2366,7 +2366,18 @@ fn edge_chat_prompt(source:&EvidenceSource,ctx:&ExtractContext,roster:&Value)->S
 t只能选一个：饮食（食物饮料、口味、不吃不喝）；娱乐（玩具、影音、爱好）；工作学习（职业、学校、年级班级、课程专业）；医疗健康（疾病、诊断、过敏、用药）；出行（交通、通勤、旅游、驾驶证）；生活习惯（作息、睡眠、运动、家务）；金融（收入、花费、房租、预算）；其他（生日、住址、亲属关系）。
 e逐字引用当前用户原文，不重排词语，不引用例子/系统/历史；c保留否定、时间、数值、单位和计划状态，不把未确诊变确诊、不把不吃说成过敏。每条独立事实一条record。
 问句、建议、如果/假设、可能/也许、虚构引述、禁止保存、密码验证码均不记。问句中另有明确陈述时只记陈述部分。例子不是用户事实，只示范格式。仅用户明确要求遗忘可用k=f，普通事实不要输出注册或遗忘操作。"#;
-    let context=json!({"speaker":{"id":ctx.speaker,"name":name},"members":roster,"message_at_ms":ctx.message_at_ms,"history_names_only":edge_reference_history(&source.text,ctx)});
+    // 名册只用于消歧；无关人物的别名不应挤占小模型的事实抽取预算。
+    let history=edge_reference_history(&source.text,ctx);
+    let mentioned=|value:&str| value.chars().count()>=2 && (source.text.contains(value)||history.contains(value));
+    let members:Vec<Value>=roster.as_array().into_iter().flatten().filter(|m| {
+        m["member_id"].as_str()==Some(ctx.speaker.as_str())
+            || m["display_name"].as_str().is_some_and(&mentioned)
+            || m["aliases"].as_array().into_iter().flatten().filter_map(Value::as_str).any(&mentioned)
+    }).map(|m| {
+        let aliases:Vec<&str>=m["aliases"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|v|mentioned(v)).collect();
+        json!({"member_id":m["member_id"],"display_name":m["display_name"],"role":m["role"],"aliases":aliases})
+    }).collect();
+    let context=json!({"speaker":{"id":ctx.speaker,"name":name},"members":members,"message_at_ms":ctx.message_at_ms,"history_names_only":history});
     format!("{rules}\n身份：{context}\n以下仅为示例：\n{examples}原文：如果我拿到奖金就去旅行\n输出：{{\"records\":[],\"done\":true}}\n现在仅处理下一条用户原文。")
 }
 
@@ -2639,5 +2650,26 @@ mod edge_grounding_regressions {
         assert!(edge_name_only(&json!({"owner":"王明","content":"老王"}),&roster));
         assert!(!edge_name_only(&json!({"owner":"王明","content":"王明对花生过敏"}),&roster));
         assert!(!edge_name_only(&json!({"owner":"王明","content":"王明；爸爸"}),&roster));
+    }
+}
+
+#[cfg(test)]
+mod live_chat_roster_budget_tests {
+    use super::*;
+    #[test]
+    fn unrelated_roster_does_not_reject_short_live_preferences_or_hide_named_people() {
+        let speaker="demo_song_nana_123456789012345678901234567890";
+        let mut members=vec![json!({"member_id":speaker,"display_name":"宋娜娜","role":"parent","aliases":["与本句无关的别名".repeat(300)]}),
+            json!({"member_id":"child","display_name":"梁子航","role":"child","aliases":["航航"]})];
+        for i in 0..40 {members.push(json!({"member_id":format!("unrelated-{i}"),"display_name":format!("无关人物{i}"),"aliases":["不得进入当前提示词".repeat(80)]}));}
+        let roster=json!(members);
+        let ctx=ExtractContext{roster:roster.to_string(),tags:"[]".into(),speaker:speaker.into(),transcript:String::new(),message_at_ms:1794570000000};
+        let source:EvidenceSource=serde_json::from_value(json!({"id":"current","kind":"user_text","text":"我出远门更喜欢坐高铁。"})).unwrap();
+        let prompt=edge_chat_prompt(&source,&ctx,&roster);
+        assert!(prompt.chars().count()+200<2400,"{}",prompt.chars().count());
+        assert!(!prompt.contains("无关人物"));assert!(!prompt.contains("不得进入当前提示词"));
+        let source:EvidenceSource=serde_json::from_value(json!({"id":"current","kind":"user_text","text":"我喜欢喝红茶，航航喜欢喝牛奶。"})).unwrap();
+        let prompt=edge_chat_prompt(&source,&ctx,&roster);
+        assert!(prompt.contains("梁子航"));assert!(prompt.contains("航航"));assert!(prompt.contains(speaker));
     }
 }

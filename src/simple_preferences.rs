@@ -39,7 +39,8 @@ pub async fn remember(
                 ..Default::default()
             })
             .await?;
-        let id = if let Some(old) = existing.items.iter().find(|r| r.content == content) {
+        let canonical_old=crate::turn_control::duplicate(engine,req.namespace.clone(),&content,&[owner.member_id.clone()],&fact.tag).await?;
+        let id = if let Some(old) = canonical_old.as_ref().or_else(||existing.items.iter().find(|r| r.content == content)) {
             old.id
         } else {
             let mut input = RememberInput::episodic(&content);
@@ -48,6 +49,8 @@ pub async fn remember(
             input.session_id = req.session_id.clone();
             input.skip_consolidation = true;
             input.metadata = crate::household::apply_tag(&json!({"skip_graph":true,"rule":"grounded_fact_rules_v2","source":{"query":fact.evidence,"evidence":fact.evidence,"source_id":sources[0].id,"kind":"user_text","message_id":req.message_id,"session_id":req.session_id,"speaker_member_id":req.speaker_id.as_deref().filter(|id|members.iter().any(|m|m.member_id==*id))},"subjects":[{"member_id":owner.member_id,"confidence":1.0}]}),fact.tag);
+            // 规则已用原文与声纹ID确认归属，同名名册不能再次扩充成多个拥有者。
+            input.metadata = crate::household::with_ownership(&input.metadata, &[owner.member_id.clone()])?;
             let id = engine.remember(input).await?;
             written.push(id.to_string());
             id
@@ -173,5 +176,31 @@ mod storage_tests {
                 "{query} missing {expected}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod enrolled_owner_tests {
+    use super::*;
+    #[tokio::test]
+    async fn enrolled_id_wins_over_duplicate_display_name_and_compound_preferences_are_recallable() {
+        let dir=tempfile::tempdir().unwrap();
+        let engine=MemoryEngine::builder().db_path(dir.path().join("known.db")).build().await.unwrap();
+        let mut members=Vec::new();
+        for id in ["enrolled-mom","other-mom"] {
+            let member=HouseholdMember{member_id:id.into(),display_name:"宋娜娜".into(),role:crate::MemberRole::Other,aliases:vec![],age_band:None};
+            engine.upsert_member(None,member.clone()).await.unwrap();members.push(member);
+        }
+        let text="我喜欢吃酸菜鱼，平时爱喝桂花乌龙茶。";
+        let req:ReconcileRequest=serde_json::from_value(json!({"query":text,"speaker_id":"enrolled-mom"})).unwrap();
+        let source:EvidenceSource=serde_json::from_value(json!({"id":"live","kind":"user_text","text":text})).unwrap();
+        let result=remember(&engine,&req,&members,&[source]).await.unwrap().unwrap();
+        assert_eq!(result.written_ids.len(),2);
+        let rows=engine.list(ListQuery::default()).await.unwrap();assert_eq!(rows.total,2);
+        for f in &rows.items {assert_eq!(f.subject_ids,vec!["enrolled-mom"]);assert_eq!(f.tag,"饮食");}
+        let query=|id:&str|crate::RecallQuery{text:"桂花乌龙茶".into(),member_id:Some(id.into()),fts_only:true,skip_graph:true,..Default::default()};
+        let hits=engine.recall(query("enrolled-mom")).await.unwrap();
+        assert!(hits.hits.iter().any(|h|h.memory.content=="宋娜娜平时爱喝桂花乌龙茶"));
+        assert!(engine.recall(query("other-mom")).await.unwrap().hits.is_empty());
     }
 }

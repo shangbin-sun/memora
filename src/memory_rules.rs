@@ -57,16 +57,17 @@ fn rules() -> &'static Vec<(&'static str, Regex)> {
 
 fn preference_tag(body: &str) -> Option<&'static str> {
     static PREF: OnceLock<Regex> = OnceLock::new();
-    let re = PREF.get_or_init(|| Regex::new(r"^(?:最近|周末|平时)?(?:最|很|一直|特别|比较|更)?(?:不喜欢|不爱|从不吃|从不喝|不吃|不喝|喜欢|中意|钟爱|爱好|爱|偏爱|讨厌|迷上了)(.{1,60})$").unwrap());
+    let re = PREF.get_or_init(|| Regex::new(r"^(?:最近|周末|平时|出(?:远)?门(?:时)?|旅行时|通勤时)?(?:最|很|一直|特别|比较|更)?(?:不喜欢|不爱|从不吃|从不喝|不吃|不喝|喜欢|中意|钟爱|爱好|爱|偏爱|讨厌|迷上了)(.{1,60})$").unwrap());
     let obj = re.captures(body)?.get(1)?.as_str();
     if has(obj,&["喜欢","讨厌","但是","不过","还是","或者","和我","而不是","才怪","并不","不是","不再","没有","的话","这句话","帮我","请","记住","保存","记录","提醒","给我"]) { return None; }
     if obj=="药" || has(obj,&["药片","药物","胶囊","止痛药","抗生素","维生素","阿莫西林","布洛芬"]) {Some("医疗健康")}
     else if ["不吃","不喝","从不吃","从不喝"].iter().any(|p|body.starts_with(p)) || obj.starts_with(['吃','喝']) {Some("饮食")}
     else if ["看电影","看电视","看纪录","看《","看吃播","玩","拼","收藏","听音乐","听广播"].iter().any(|p|obj.starts_with(p)) {Some("娱乐")}
     else if has(obj,&["菜是","饮品是","口味","酸菜鱼","咖啡","拿铁","奶茶","饮料","牛奶","豆浆","米饭","面条","饺子","火锅","川菜","甜食","辣椒","香菜","榴莲","海鲜","茶"]) {Some("饮食")}
+    else if Regex::new(r"^(?:(?:坐|乘坐|乘|搭)(?:高铁|火车|地铁|公交|飞机|轮渡)|开车|骑车|骑自行车)(?:出行|通勤)?$").unwrap().is_match(obj) {Some("出行")}
     else if has(obj,&["学英语","学数学","学编程","学钢琴","读书学习"]) {Some("工作学习")}
     else if has(obj,&["跑步","慢跑","散步","早睡","健身","游泳"]) {Some("生活习惯")}
-    else if has(obj,&["积木","乐高","游戏","电影","音乐","动漫","羽毛球","篮球","足球","象棋","书法","摄影","画画"]) {Some("娱乐")}
+    else if has(obj,&["积木","乐高","游戏","电影","纪录片","音乐","动漫","羽毛球","篮球","足球","象棋","书法","摄影","画画"]) {Some("娱乐")}
     else {None}
 }
 
@@ -91,9 +92,11 @@ pub(crate) fn analyze(text: &str, members: &[HouseholdMember], speaker: Option<&
     for raw in text.split(['，',',','。','；',';','！','!','\n']) {
         let clause=raw.trim();
         if clause.is_empty() || ["好的","嗯","哦","记住了"].contains(&clause) {continue;}
-        if rejection(text,clause).is_some() {result.complete=false;continue;}
+        if rejection(text,clause).is_some() {result.complete=false;carry=None;continue;}
         let resolved=subject(clause,members,speaker).or_else(|| {
             clause.strip_prefix('也').and_then(|rest|carry.map(|m|(m,rest)))
+                // 仅继承紧邻的、已确认人物的完整偏好谓语，不从任意省略主语的文本猜人物。
+                .or_else(|| carry.filter(|_| preference_tag(clause).is_some()).map(|m|(m,clause)))
         });
         let Some((owner,predicate))=resolved else {
             if let Some(fact)=embedded_first_person(clause,members,speaker) {result.facts.push(fact);continue;}
@@ -104,7 +107,7 @@ pub(crate) fn analyze(text: &str, members: &[HouseholdMember], speaker: Option<&
                 let combined=format!("{}，{}",last.evidence,clause);
                 if support && text.contains(&combined) {last.evidence=combined;last.content.push_str(&format!("，{clause}"));continue;}
             }
-            result.complete=false;continue;
+            result.complete=false;carry=None;continue;
         };
         let tag=preference_tag(predicate).or_else(|| rules().iter().find(|(_,re)|re.is_match(predicate)).map(|(tag,_)|*tag)).or_else(||embedded_tag(clause));
         let Some(tag)=tag else {result.complete=false;carry=None;continue;};
@@ -291,5 +294,57 @@ mod tests {
             }
         }
         assert_eq!(positives,64);assert_eq!(negatives,96);
+    }
+}
+
+#[cfg(test)]
+mod continued_preference_tests {
+    use super::*;
+    fn roster() -> Vec<HouseholdMember> {
+        [("mom","宋娜娜"),("child","梁子航")].into_iter().map(|(id,name)|HouseholdMember {
+            member_id:id.into(),display_name:name.into(),role:crate::MemberRole::Other,aliases:vec![],age_band:None,
+        }).collect()
+    }
+    #[test]
+    fn continuous_preferences_keep_exact_evidence_negation_and_verified_owner() {
+        for (text,tags) in [
+            ("我喜欢吃酸菜鱼，平时爱喝桂花乌龙茶。",vec!["饮食","饮食"]),
+            ("我喜欢喝普洱茶，周末喜欢看悬疑电影。",vec!["饮食","娱乐"]),
+            ("我喜欢吃饺子，平时不喝咖啡。",vec!["饮食","饮食"]),
+        ] {
+            let r=analyze(text,&roster(),Some("mom"));assert!(r.complete,"{r:?}");assert_eq!(r.facts.len(),2);
+            for (f,tag) in r.facts.iter().zip(tags) {assert_eq!(f.owner,"mom");assert_eq!(f.tag,tag);assert!(text.contains(&f.evidence));}
+        }
+        let r=analyze("我喜欢吃饺子，平时不喝咖啡。",&roster(),Some("mom"));
+        assert_eq!(r.facts[1].content,"宋娜娜平时不喝咖啡");
+        assert!(analyze("我喜欢吃鱼，平时爱喝茶。",&roster(),None).facts.is_empty());
+    }
+    #[test]
+    fn unsupported_or_new_subject_breaks_inheritance() {
+        for text in ["我喜欢吃鱼，老师来过，平时爱喝茶。","我喜欢吃鱼，她爱喝茶。","我喜欢吃鱼，妈妈爱喝茶。"] {
+            let r=analyze(text,&roster(),Some("mom"));assert!(!r.complete);
+            assert_eq!(r.facts.len(),1,"{text}: {r:?}");assert!(!r.facts.iter().any(|f|f.content.contains("茶")));
+        }
+        let r=analyze("宋娜娜爱吃鱼，平时爱喝豆浆。",&roster(),Some("child"));
+        assert_eq!(r.facts.len(),2);assert!(r.facts.iter().all(|f|f.owner=="mom"));
+        let r=analyze("我喜欢吃鱼，梁子航喜欢吃饺子，平时爱喝豆浆。",&roster(),Some("mom"));
+        assert_eq!(r.facts.iter().map(|f|f.owner.as_str()).collect::<Vec<_>>(),vec!["mom","child","child"]);
+    }
+}
+
+#[cfg(test)]
+mod transport_preference_tests {
+    use super::*;
+    #[test]
+    fn transport_preferences_keep_negation_and_do_not_confuse_movies_with_travel() {
+        let m=HouseholdMember{member_id:"known".into(),display_name:"宋娜娜".into(),role:crate::MemberRole::Other,aliases:vec![],age_band:None};
+        for text in ["我出远门更喜欢坐高铁。","我通勤时更喜欢骑自行车。","我不喜欢坐飞机。"] {
+            let r=analyze(text,&[m.clone()],Some("known"));assert!(r.complete,"{text}: {r:?}");
+            assert_eq!(r.facts.len(),1);assert_eq!(r.facts[0].tag,"出行");assert!(r.facts[0].content.contains(text.trim_end_matches('。').trim_start_matches('我')));
+        }
+        let r=analyze("我喜欢看高铁纪录片。",&[m.clone()],Some("known"));assert_eq!(r.facts[0].tag,"娱乐");
+        for text in ["如果我喜欢坐高铁就好了。","我出远门喜欢坐高铁吗？","她喜欢坐高铁。"] {
+            assert!(analyze(text,&[m.clone()],Some("known")).facts.is_empty(),"{text}");
+        }
     }
 }

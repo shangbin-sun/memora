@@ -1279,7 +1279,20 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_reconcileTurn(
             return std::ptr::null_mut();
         }
     };
-    match runtime().block_on(reconcile_turn_incremental(&engine, &chat, req)) {
+    let session=req.session_id.clone(); let message=req.message_id.clone(); let ns=req.namespace.clone();
+    let outcome=runtime().block_on(async {
+        let future=reconcile_turn_incremental(&engine,&chat,req);
+        tokio::pin!(future);
+        loop {
+            if engine.turn_canceled(ns.as_deref(),session.as_deref(),message.as_deref()) { return None; }
+            tokio::select! {
+                result=&mut future=>return Some(result),
+                _=tokio::time::sleep(std::time::Duration::from_millis(50))=>{}
+            }
+        }
+    });
+    let Some(outcome)=outcome else {return to_jstring(&mut env,r#"{"skipped":true,"skip_reason":"turn_retracted","written_ids":[],"revised_ids":[]}"#);};
+    match outcome {
         Ok(report) => match serde_json::to_string(&report) {
             Ok(s) => to_jstring(&mut env, s),
             Err(e) => {
@@ -1896,4 +1909,18 @@ pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_wrongPractice(
         Ok(value) => to_jstring(&mut env, value.to_string()),
         Err(error) => { throw_runtime(&mut env, error); std::ptr::null_mut() }
     }
+}
+
+
+/// 宿主规则控制，独立于LLM工具和聊天提示词。
+#[no_mangle]
+pub extern "system" fn Java_com_aiwf_memory_memora_MemoraNative_controlTurn(mut env:JNIEnv,_class:JClass,handle:jlong,body_json:JString)->jstring {
+ let result=(||->std::result::Result<String,String> {
+  let raw=jstring_to_string(&mut env,body_json)?;
+  let body=serde_json::from_str(&raw).map_err(|e|format!("controlTurn json: {e}"))?;
+  let engine=engine_of(handle)?;
+  let result=runtime().block_on(engine.control_turn(body)).map_err(|e|e.to_string())?;
+  serde_json::to_string(&result).map_err(|e|e.to_string())
+ })();
+ match result {Ok(s)=>to_jstring(&mut env,s),Err(e)=>{throw_runtime(&mut env,e);std::ptr::null_mut()}}
 }

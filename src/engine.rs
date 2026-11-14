@@ -64,6 +64,7 @@ struct Inner {
     namespace: String,
     data_epoch: std::sync::atomic::AtomicU64,
     mutation_lock: tokio::sync::Mutex<()>,
+    turn_control: Arc<crate::turn_control::State>,
     dream_lock: tokio::sync::Mutex<()>,
     embed_job: Mutex<Option<tokio::task::JoinHandle<()>>>,
     closed: std::sync::atomic::AtomicBool,
@@ -219,6 +220,7 @@ impl EngineBuilder {
             .is_some_and(|extractor| extractor.extractor_id() != "empty-kg-v1");
         let start_graph_worker = self.graph_projection_worker && graph_extractor_configured;
         let query_embeddings = crate::query_embedding::QueryEmbeddingCache::new(&self.config);
+        let turn_control = Arc::new(crate::turn_control::State::load(&pool)?);
         let engine = MemoryEngine {
             inner: Arc::new(Inner {
                 pool,
@@ -246,6 +248,7 @@ impl EngineBuilder {
                 namespace,
                 data_epoch: std::sync::atomic::AtomicU64::new(0),
                 mutation_lock: tokio::sync::Mutex::new(()),
+                turn_control,
                 dream_lock: tokio::sync::Mutex::new(()),
                 embed_job: Mutex::new(None),
                 closed: std::sync::atomic::AtomicBool::new(false),
@@ -1717,6 +1720,49 @@ impl MemoryEngine {
         Ok((merged, count, 0))
     }
 
+    pub(crate) fn turn_canceled(&self, ns:Option<&str>, session:Option<&str>, message:Option<&str>)->bool {
+        match (session,message) { (Some(s),Some(m))=>self.inner.turn_control.canceled.lock().unwrap().contains(&crate::turn_control::key(ns.unwrap_or(self.namespace()),s,m)), _=>false }
+    }
+
+    pub(crate) async fn control_turn(&self, body:serde_json::Value)->Result<serde_json::Value> {
+        if body["action"]=="preview" {return crate::turn_control::preview(self,&body).await;}
+        if body["action"]!="revoke" && body["action"]!="cancel" {return Err(MemoraError::Other("unknown turn control action".into()));}
+        let session=body["session_id"].as_str().filter(|s|!s.is_empty()).ok_or_else(||MemoraError::Other("session_id required".into()))?;
+        let message=body["message_id"].as_str().filter(|s|!s.is_empty()).ok_or_else(||MemoraError::Other("message_id required".into()))?;
+        let ns=body["namespace"].as_str().unwrap_or(self.namespace());
+        let key=crate::turn_control::key(ns,session,message);
+        // 和最终SQLite提交共用同一把来源锁。标记后进行中的推理会尽快退出。
+        {
+            let mut guard=self.inner.turn_control.canceled.lock().unwrap();
+            self.inner.pool.get()?.execute("INSERT OR IGNORE INTO memora_turn_retractions(source_key) VALUES (?1)",[&key])?;
+            guard.insert(key.clone());
+        }
+        if body["action"]=="cancel" {return Ok(serde_json::json!({"canceled":true}));}
+        // 等待已进入最终写入的事务结束，再清理；不等模型HTTP。
+        let rows={
+            let _mutation=self.inner.mutation_lock.lock().await;
+            let mut rows=Vec::new(); let mut offset=0;
+            loop {
+                let page=self.list(ListQuery{namespace:Some(ns.into()),facts_only:true,limit:Some(200),offset:Some(offset),..Default::default()}).await?;
+                offset+=page.items.len(); rows.extend(page.items);
+                if offset as i64>=page.total {break;}
+            }
+            rows
+        };
+        let ids=body["ids"].as_array().cloned().unwrap_or_default();
+        let speaker=body["speaker_id"].as_str();
+        let mut deleted=Vec::new();
+        for row in rows {
+            let own_source=crate::turn_control::source_key(&row.namespace,row.session_id.as_deref(),&row.metadata).as_deref()==Some(key.as_str());
+            let duplicate_target=speaker.is_some_and(|s|row.subject_ids==vec![s.to_string()]) && ids.iter().any(|id|id.as_str()==Some(row.id.to_string().as_str()));
+            if own_source || duplicate_target {
+                self.forget(row.id,ForgetReason::User{reason:"用户撤回上一条记忆".into()}).await?;
+                deleted.push(row.id.to_string());
+            }
+        }
+        Ok(serde_json::json!({"canceled":true,"deleted_ids":deleted}))
+    }
+
     pub fn namespace(&self) -> &str {
         &self.inner.namespace
     }
@@ -2264,6 +2310,13 @@ impl MemoryEngine {
         }
         let metadata = household::apply_tag(&metadata, &tag);
         let subject_ids = household::subject_id_list(&metadata);
+        {
+            let guard=self.inner.turn_control.canceled.lock().unwrap();
+            if crate::turn_control::canceled(&guard,&ns,Some(&session),&metadata) {return Err(MemoraError::Rejected("turn_retracted".into()));}
+        }
+        if metadata["source"]["kind"]=="user_text" && !subject_ids.is_empty() && tag!="错题集" {
+            if let Some(old)=crate::turn_control::duplicate(self,Some(ns.clone()),&input.content,&subject_ids,&tag).await? { return Ok(old.id); }
+        }
         let s = stability(
             self.inner.config.s0,
             self.inner.config.alpha,
@@ -2321,8 +2374,11 @@ impl MemoryEngine {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| rec.content.clone());
+        let turn_control=self.inner.turn_control.clone();
         tokio::task::spawn_blocking(move || {
             retry_busy(|| {
+                let guard=turn_control.canceled.lock().unwrap();
+                if crate::turn_control::canceled(&guard,&rec_clone.namespace,rec_clone.session_id.as_deref(),&rec_clone.metadata) {return Err(MemoraError::Rejected("turn_retracted".into()));}
                 let mut conn = pool.get()?;
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -2413,14 +2469,17 @@ impl MemoryEngine {
         let jieba = self.inner.jieba.clone();
         let pending = self.inner.embedder.is_some();
         let content_changed = update.content.is_some();
+        let turn_control=self.inner.turn_control.clone();
         let (affected, graph_inputs_changed, graph_work_queued) =
             tokio::task::spawn_blocking(move || {
                 retry_busy(|| {
+                    let guard=turn_control.canceled.lock().unwrap();
                     let mut conn = pool.get()?;
                     let tx =
                         conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     let mut rec = get_memory(&tx, id)?
                         .ok_or_else(|| MemoraError::NotFound(id.to_string()))?;
+                    if update.metadata.as_ref().is_some_and(|m|crate::turn_control::canceled(&guard,&rec.namespace,rec.session_id.as_deref(),m)) {return Err(MemoraError::Rejected("turn_retracted".into()));}
                     let retained_atom = rec.state == MemoryState::Archived
                         && rec.metadata.get("recall_archived").and_then(|v| v.as_bool()) == Some(true);
                     if rec.state != MemoryState::Active && !retained_atom {
