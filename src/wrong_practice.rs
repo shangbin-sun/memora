@@ -643,13 +643,17 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         } else {
             resolved_question_labels(&body["question_labels"][number.to_string()],raw_q,heading)
         };
-        // 用户指定口算图仅保留转录与答错状态，不生成标准答案或解析。
-        let transcription_only = image
-            && text.starts_with("# 错题原文（仅转录）")
-            && raw_q == "1.2×2=40 答错";
-        let a = if transcription_only { String::new() } else { answer(&q) };
-        let child = if transcription_only { "40".into() } else { child_answer(&q, heading) };
-        q = if transcription_only { "2×2=40 答错".into() } else { compact_record(&q, &a, &child) };
+        // 图片类型已由OCR判断；专用转录通道不生成标准答案或解析。
+        let transcription = if image && text.starts_with("# 错题原文（仅转录）") {
+            Some(Regex::new(r"^\d+[.．、。]\s*(\d+[+\-×÷]\d+=\d+)\s+答错$").unwrap()
+                .captures(raw_q)
+                .ok_or_else(|| crate::error::MemoraError::InvalidState("错题算式转录不完整".into()))?[1].to_string())
+        } else { None };
+        let a = if transcription.is_some() { String::new() } else { answer(&q) };
+        let child = if let Some(equation) = &transcription {
+            equation.rsplit('=').next().unwrap_or("").to_string()
+        } else { child_answer(&q, heading) };
+        q = if let Some(equation) = transcription { format!("{equation} 答错") } else { compact_record(&q, &a, &child) };
         if let Some(old) = existing.iter().find(|old| {
             old.number == number
                 && (old.meta["source_id"] == source || question_key(&old.raw) == question_key(&q))
