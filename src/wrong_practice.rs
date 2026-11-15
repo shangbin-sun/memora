@@ -133,7 +133,7 @@ fn choice_spans(text: &str) -> Vec<ChoiceSpan> {
         .collect()
 }
 fn grading_mark() -> Regex {
-    Regex::new(r"(?:[×✗✘❌]|[ \t]+[Xx])[ \t　。.!！\r\n]*$").unwrap()
+    Regex::new(r"(?:[×✗✘❌]|[ \t]*[Xx])[ \t　。.!！\r\n]*$").unwrap()
 }
 fn before_answer_fields(text: &str) -> &str {
     Regex::new(r"(?:订正|訂正|改正|更正|正确答案|标准答案|参考答案|解析|孩子答案|孩子选择)[：:]")
@@ -178,7 +178,10 @@ fn question(text: &str) -> String {
         let options: Vec<_> = choices
             .iter()
             .map(|option| {
-                let value = mark.replace(&t[option.body_start..option.end], "");
+                let body = &t[option.body_start..option.end];
+                let value = if mark.find(body).is_some_and(|m| !body[..m.start()].trim().is_empty()) {
+                    mark.replace(body, "")
+                } else { std::borrow::Cow::Borrowed(body) };
                 format!("{}. {}", option.label, value.trim())
             })
             .collect();
@@ -268,6 +271,9 @@ fn explanation(text: &str) -> Option<String> {
     None
 }
 fn compact_record(text: &str, correct: &str, child: &str) -> String {
+    compact_record_for_source(text, correct, child, false)
+}
+fn compact_record_for_source(text: &str, correct: &str, child: &str, image: bool) -> String {
     let text = text.split("练习题面：").last().unwrap_or(text);
     let text = Regex::new(r"^\s*\d+[.．、。]\s*")
         .unwrap()
@@ -275,30 +281,22 @@ fn compact_record(text: &str, correct: &str, child: &str) -> String {
     let stem = question(&text);
     let stem = Regex::new(r"_+").unwrap().replace_all(&stem, "（ ）");
     let stem = stem.trim().trim_end_matches('*').trim();
-    let extracted_explanation = explanation(&text);
-    let source = Regex::new(r"[（(]([^（）()]*《[^》]+》)[）)]")
-        .unwrap()
-        .captures(&text)
-        .map(|c| c[1].to_string())
-        .unwrap_or_default();
-    let fallback = if source.is_empty() {
-        "按题意核对正确答案。".to_string()
-    } else {
-        format!("{}。", source)
-    };
-    let explanation = extracted_explanation.as_deref().unwrap_or(&fallback);
+    let extracted_explanation = explanation(&text).or_else(|| {
+        if image { return None; }
+        let source = Regex::new(r"[（(]([^（）()]*《[^》]+》)[）)]").unwrap()
+            .captures(&text).map(|c| c[1].to_string()).unwrap_or_default();
+        Some(if source.is_empty() { "按题意核对正确答案。".to_string() } else { format!("{}。", source) })
+    });
     let stem = Regex::new(r"\s*([ABCD][.．、])\s*")
         .unwrap()
         .replace_all(stem, "　$1 ");
     // 选项横排，具体换行由UI按实际测量宽度处理。
     let stem = stem.replace("　A.", "\nA.");
-    format!(
-        "{}\n**孩子答案：{}　正确答案：{}**　解析：{}",
-        stem.trim(),
-        child,
-        correct,
-        explanation
-    )
+    let mut fields = format!("**孩子答案：{child}");
+    if !correct.is_empty() { fields.push_str(&format!("　正确答案：{correct}")); }
+    fields.push_str("**");
+    if let Some(explanation) = extracted_explanation { fields.push_str(&format!("　解析：{explanation}")); }
+    format!("{}\n{}", stem.trim(), fields)
 }
 fn question_key(text: &str) -> String {
     let stem = question(text).replace("每个小朋友分到几个苹果", "每人分到几个");
@@ -651,6 +649,12 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         if image && text.starts_with("# 错题原文（仅转录）") && calculated.is_none() {
             return Err(crate::error::MemoraError::InvalidState("数学表达式无效、超出支持范围或无法安全计算".into()));
         }
+        if image && calculated.is_none() && choice_spans(&question(&q)).len() >= 2 {
+            let selected = child_answer(&q, heading);
+            if !["A", "B", "C", "D"].contains(&selected.as_str()) {
+                return Err(crate::error::MemoraError::InvalidState("孩子答案未辨认，不能保存为已作答错题".into()));
+            }
+        }
         if calculated.as_ref().is_some_and(|checked| checked.correct) {
             skipped_correct += 1;
             continue;
@@ -661,7 +665,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
             (checked.correct_answer.clone(), checked.child_answer.clone())
         } else {
             let a = answer(&q); let child = child_answer(&q, heading);
-            q = compact_record(&q, &a, &child);
+            q = compact_record_for_source(&q, &a, &child, image);
             (a, child)
         };
         if let Some(old) = existing.iter().find(|old| {
@@ -2062,5 +2066,56 @@ mod calculated_math_tests {
         let (_dir,e)=engine().await;
         for text in ["2×=40","1÷0=0","2^999999=0"] {assert!(e.wrong_practice(input(text,text)).await.is_err());}
         assert_eq!(e.list(ListQuery::default()).await.unwrap().total,0);
+    }
+}
+
+#[cfg(test)]
+mod choice_image_tests {
+    use super::*;
+    const TEXT: &str = "1.选择题：小明有12个苹果，平均分给4个小朋友，每人分到几个？\nA.2个\nB.3个\nC.4个X\nD.6个\n孩子选择：C";
+    #[test] fn glued_cross_is_not_option_text_and_multiplication_is_preserved() {
+        let text=compact_record_for_source(TEXT,"B","C",true);
+        assert!(text.contains("C. 4个"));assert!(!text.contains("4个X"));
+        assert!(text.contains("孩子答案：C　正确答案：B"));assert!(!text.contains("解析"));
+        assert!(question(&TEXT.replace("4个X","4×2")).contains("C. 4×2"));
+        assert!(question(&TEXT.replace("4个X","X")).contains("C. X"));
+    }
+    #[tokio::test] async fn child_only_image_is_saved_without_invented_answer_or_explanation() {
+        let dir=tempfile::tempdir().unwrap();
+        let engine=crate::MemoryEngine::builder().db_path(dir.path().join("choice.db")).build().await.unwrap();
+        let result=engine.wrong_practice(json!({"action":"import","text":format!("数学错题整理\n姓名：梁子航\n{TEXT}"),"kind":"image_ocr","source_id":"child-only"})).await.unwrap();
+        assert_eq!(result["count"],1);
+        let page=engine.list(ListQuery::default()).await.unwrap();let item=&page.items[0];
+        assert!(item.content.contains("**孩子答案：C**"));assert!(!item.content.contains("正确答案"));assert!(!item.content.contains("解析"));assert!(!item.content.contains("4个X"));
+        assert_eq!(item.metadata["child_answer"],"C");assert_eq!(item.metadata["answer"],"");
+        let bad=engine.wrong_practice(json!({"action":"import","text":format!("数学错题整理\n姓名：梁子航\n{}",TEXT.replace("C.4个X","C.4个").replace("孩子选择：C","")),"kind":"image_ocr","source_id":"unread-child"})).await;
+        assert!(bad.is_err());
+    }
+}
+
+#[cfg(test)]
+mod dual_image_protocol_tests {
+    use super::*;
+    #[tokio::test]
+    async fn both_image_documents_share_owner_but_keep_separate_answer_logic() {
+        let dir=tempfile::tempdir().unwrap();
+        let e=crate::MemoryEngine::builder().db_path(dir.path().join("dual.db")).build().await.unwrap();
+        for (source,text) in [
+            ("arithmetic","# 错题原文（仅转录）\n归属：梁子航\n1.2×2=40 答错"),
+            ("choice","# 图片错题（圈选）\n归属：梁子航\n数学错题整理\n1.选择题：12个苹果平均分给4人，每人几个？\nA.2个\nB.3个\nC.4个X\nD.6个\n孩子选择：C"),
+        ] {
+            let result=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":source,"text":text})).await.unwrap();
+            assert_eq!(result["count"],1);assert_eq!(result["owner"],"梁子航");
+        }
+        let page=e.list(ListQuery::default()).await.unwrap();assert_eq!(page.total,2);
+        let math=page.items.iter().find(|m|m.metadata["question_label_source"]=="program").unwrap();
+        assert_eq!(math.content,"乘法题 2×2\n**孩子答案：40　正确答案：4**");
+        let choice=page.items.iter().find(|m|m.metadata["child_answer"]=="C").unwrap();
+        assert!(!choice.content.contains("4个X"));assert!(choice.content.contains("**孩子答案：C**"));
+        assert!(!choice.content.contains("正确答案"));assert!(!choice.content.contains("解析"));
+        assert_eq!(math.metadata["subjects"],choice.metadata["subjects"]);
+        let correct=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"right","text":"# 错题原文（仅转录）\n归属：梁子航\n1.2×2=4 答错"})).await.unwrap();
+        assert_eq!(correct["count"],0);assert_eq!(correct["skipped_correct"],1);
+        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,2);
     }
 }
