@@ -69,18 +69,20 @@ fn arithmetic_labels(text: &str) -> Vec<String> {
 // 升级用户上传旧题只补标签，不改正文、上传时间、显式预设标签或UI排序。
 fn refresh_arithmetic_labels(conn: &Connection, ns: &str, jieba: &jieba_rs::Jieba) -> Result<()> {
     for q in load(conn,ns)? {
-        if q.meta["question_labels_version"] == 2 || q.meta["question_label_source"] == "preset" { continue; }
+        if q.meta["question_labels_version"] == 3 || q.meta["question_label_source"] == "preset" { continue; }
         let id=Uuid::parse_str(&q.id).map_err(|e|crate::error::MemoraError::InvalidState(e.to_string()))?;
         let Some(mut rec)=store::get_memory(conn,id)? else { continue; };
         let source=if rec.metadata["question_edited"]==true {rec.content.as_str()} else {rec.metadata["original_text"].as_str().unwrap_or(&rec.content)};
-        let mut tags=rec.metadata["question_types"].as_array().cloned().unwrap_or_default();
-        for tag in labels(source, "") {
+        let rules=crate::question_rules::classify(source, "");
+        let mut tags:Vec<Value>=rec.metadata["question_types"].as_array().cloned().unwrap_or_default().into_iter()
+            .filter(|tag|!rules.forbidden.contains(&tag.as_str().unwrap_or(""))).collect();
+        for tag in rules.tags {
             if !tags.contains(&json!(tag)) { tags.push(json!(tag)); }
         }
         if tags.iter().any(|t| matches!(t.as_str(),Some("加法题"|"减法题"|"乘法题"|"除法题"))) && !tags.contains(&json!("算术题")) { tags.push(json!("算术题")); }
         rec.metadata["question_types"]=json!(tags);
         rec.metadata["arithmetic_labels_version"]=json!(1);
-        rec.metadata["question_labels_version"]=json!(2);
+        rec.metadata["question_labels_version"]=json!(3);
         store::update_memory(conn,&mut rec,jieba)?;
     }
     Ok(())

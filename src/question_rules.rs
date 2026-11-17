@@ -63,6 +63,12 @@ pub(crate) fn classify(text:&str,heading:&str)->Classification {
     for (on,tag) in [(decimal,"小数题"),(has(&stem,&["最大公因数"]),"最大公因数题"),(has(&stem,&["最小公倍数"]),"最小公倍数题"),(has(&stem,&["因数","倍数"]),"因数倍数题"),(has(&stem,&["质数","合数"]),"质数合数题"),(stem.contains("位小数"),"小数位数题"),(compare,"商积比较题"),((plus||minus)&&(multiply||divide),"四则混合运算题")] {
         if on && !language {add(&mut out.required,"数学题");add(&mut out.required,tag);}
     }
+    // 有明确数学题干时，模型不得补入没有题面证据的其他学科或知识点。
+    if math {
+        for (on,tag) in [(geometry,"几何题"),(fraction,"分数题"),(numeric,"数的认识题"),(time,"时间计算题"),(units,"单位换算题"),(literature,"古诗题"),(application,"应用题"),(decimal,"小数题"),(has(&stem,&["最大公因数"]),"最大公因数题"),(has(&stem,&["最小公倍数"]),"最小公倍数题"),(has(&stem,&["因数","倍数"]),"因数倍数题"),(has(&stem,&["质数","合数"]),"质数合数题"),(stem.contains("位小数"),"小数位数题"),(compare,"商积比较题"),((plus||minus)&&(multiply||divide),"四则混合运算题")] {
+            if !on {out.forbidden.push(tag);}
+        }
+    }
     // 明确单一运算或非运算概念不接受模型凭空附加其他运算。
     if math && ((plus||minus||multiply||divide) || numeric || fraction || units || (geometry&&!computation)) {
         for (on,tag) in [(plus,"加法题"),(minus,"减法题"),(plus||minus||mixed_add,"加减法题"),(multiply,"乘法题"),(divide,"除法题"),(multiply||divide||mixed_mul,"乘除法题")] {if !on {out.forbidden.push(tag);}}
@@ -133,8 +139,9 @@ mod tests {
  #[test]
  fn valid_json_is_still_corrected_when_model_misses_division_or_invents_subject() {
   let r=classify("12个苹果平均分给4人，每人几个？A.2 B.3","");
-  let bad=vec!["语文题".into(),"加减法题".into()];let fixed=validate_model(&bad,&r).unwrap();
+  let bad=vec!["语文题".into(),"加减法题".into(),"几何题".into(),"古诗题".into(),"最大公因数题".into()];let fixed=validate_model(&bad,&r).unwrap();
   assert!(fixed.contains(&"除法题".into()));assert!(fixed.contains(&"数学题".into()));assert!(!fixed.contains(&"语文题".into()));assert!(!fixed.contains(&"加减法题".into()));
+  for tag in ["几何题","古诗题","最大公因数题"] {assert!(!fixed.contains(&tag.to_owned()));}
   assert!(validate_model(&r.tags,&r).is_none());
  }
 }
