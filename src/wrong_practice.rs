@@ -17,7 +17,7 @@ fn norm(s: &str) -> String {
         .flat_map(char::to_lowercase)
         .collect()
 }
-const QUESTION_TAGS: &[&str] = &["数学题","语文题","选择题","判断题","填空题","算术题","几何题","古诗题","加法题","减法题","加减法题","乘法题","除法题","乘除法题","分数题","时间计算题","单位换算题","数的认识题","应用题"];
+const QUESTION_TAGS: &[&str] = &["数学题","语文题","选择题","判断题","填空题","算术题","几何题","古诗题","加法题","减法题","加减法题","乘法题","除法题","乘除法题","分数题","时间计算题","单位换算题","数的认识题","应用题","小数题","最大公因数题","最小公倍数题","因数倍数题","质数合数题","小数位数题","商积比较题","四则混合运算题"];
 
 fn validated_question_tags(value: &Value) -> Option<Vec<String>> {
     let values=value.as_array()?;
@@ -61,24 +61,26 @@ pub(crate) fn relabel_edited_question(rec: &mut MemoryRecord, patch: Option<&Val
     if let Some(meta)=rec.metadata.as_object_mut() {meta.remove("last_presented_upload_ms");}
 }
 
+#[cfg(test)]
 fn arithmetic_labels(text: &str) -> Vec<String> {
     crate::question_rules::classify(text,"").tags.into_iter().filter(|t|["加法题","减法题","加减法题","乘法题","除法题","乘除法题"].contains(&t.as_str())).collect()
 }
 
-// 升级旧题只补标签，不改正文、上传时间或UI排序。
+// 升级用户上传旧题只补标签，不改正文、上传时间、显式预设标签或UI排序。
 fn refresh_arithmetic_labels(conn: &Connection, ns: &str, jieba: &jieba_rs::Jieba) -> Result<()> {
     for q in load(conn,ns)? {
-        if q.meta["arithmetic_labels_version"] == 1 || q.meta["question_label_source"]=="preset" || matches!(q.meta["question_label_source"].as_str(),Some("edge_model"|"rules_corrected")) { continue; }
+        if q.meta["question_labels_version"] == 2 || q.meta["question_label_source"] == "preset" { continue; }
         let id=Uuid::parse_str(&q.id).map_err(|e|crate::error::MemoraError::InvalidState(e.to_string()))?;
         let Some(mut rec)=store::get_memory(conn,id)? else { continue; };
         let source=if rec.metadata["question_edited"]==true {rec.content.as_str()} else {rec.metadata["original_text"].as_str().unwrap_or(&rec.content)};
         let mut tags=rec.metadata["question_types"].as_array().cloned().unwrap_or_default();
-        for tag in arithmetic_labels(source) {
+        for tag in labels(source, "") {
             if !tags.contains(&json!(tag)) { tags.push(json!(tag)); }
         }
         if tags.iter().any(|t| matches!(t.as_str(),Some("加法题"|"减法题"|"乘法题"|"除法题"))) && !tags.contains(&json!("算术题")) { tags.push(json!("算术题")); }
         rec.metadata["question_types"]=json!(tags);
         rec.metadata["arithmetic_labels_version"]=json!(1);
+        rec.metadata["question_labels_version"]=json!(2);
         store::update_memory(conn,&mut rec,jieba)?;
     }
     Ok(())
@@ -473,7 +475,7 @@ fn latest_uploaded_questions(conn: &Connection, ns: &str, body: &Value) -> Resul
     questions.sort_by_key(|q| (q.meta["source_order"].as_i64().unwrap_or(0),q.number,q.id.clone()));
     // 原文是记忆事实正文：保持每条content逐字不变，仅以换行连接多条事实。
     let contents: Vec<_> = questions.iter().map(|q| q.raw.as_str()).collect();
-    let questions: Vec<_> = questions.iter().map(|q|json!({"question_id":q.id,"content":q.raw})).collect();
+    let questions: Vec<_> = questions.iter().map(|q|json!({"question_id":q.id,"content":q.raw,"question_types":q.meta["question_types"]})).collect();
     Ok(json!({"ok":true,"content":contents.join("\n"),"questions":questions,"upload_id":upload}))
 }
 
@@ -751,6 +753,12 @@ fn query_types(q: &str) -> Vec<&'static str> {
     for (word,tag) in [("加法","加法题"),("减法","减法题"),("乘法","乘法题"),("除法","除法题")] { if singles.contains(word) { types.push(tag); } }
     if q.contains("加减法") { types.push("加减法题"); }
     if q.contains("乘除法") { types.push("乘除法题"); }
+    for tag in QUESTION_TAGS {
+        if q.contains(tag) && !types.contains(tag) {types.push(tag);}
+    }
+    for (word,tag) in [("小数","小数题"),("最大公因数","最大公因数题"),("最小公倍数","最小公倍数题"),("因数倍数","因数倍数题"),("质数合数","质数合数题"),("小数位数","小数位数题"),("商积比较","商积比较题"),("四则混合运算","四则混合运算题")] {
+        if q.contains(word) && !types.contains(&tag) {types.push(tag);}
+    }
     types
 }
 fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result<Value> {
@@ -1098,6 +1106,10 @@ fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result
                     filtered.retain(|q| matched.iter().any(|t| q.raw.contains(t)));
                 } else if number_match.is_none() {
                     let mut content = query.to_string();
+                    // 类型已用于metadata过滤，不再把分类名当作题面关键词。
+                    let mut type_words = types.clone();
+                    type_words.sort_by_key(|tag| std::cmp::Reverse(tag.len()));
+                    for tag in type_words { content = content.replace(tag, " ").replace(tag.trim_end_matches('题'), " "); }
                     for member in &named { content = content.replace(&member.display_name, " "); }
                     for word in [
                         "小北同学",
@@ -1894,6 +1906,25 @@ mod id_delete_arithmetic_tests {
         let imported=e.wrong_practice(json!({"action":"import","text":BANK,"source_id":"upload:math","uploaded_at_ms":100})).await.unwrap();
         assert_eq!(imported["count"],9);
         (dir,e,path,imported)
+    }
+    #[tokio::test]
+    async fn fifth_grade_filters_latest_tags_and_legacy_backfill_preserve_real_questions() {
+        let (_dir,e,path,_)=setup().await;
+        let text="# 图片错题（题目与孩子答案）\n归属：梁子航\n1.24和36的最大公因数是（ ）。\n孩子答案：6\n2.9和12的最小公倍数是（ ）。\n孩子答案：18\n3.最小的合数是（ ）。\n孩子答案：2\n4.7.8÷1.3的商比7.8（ ）。\n孩子答案：大\n5.（8.4-2.4）÷1.5\n孩子答案：6";
+        let imported=e.wrong_practice(json!({"action":"import","text":text,"kind":"image_ocr","source_id":"new-five","upload_id":"new-five","uploaded_at_ms":200})).await.unwrap();
+        assert_eq!(imported["count"],5);
+        let first=imported["ids"][0].as_str().unwrap();
+        let conn=Connection::open(&path).unwrap();
+        conn.execute("UPDATE memories SET metadata_json=json_remove(json_set(metadata_json,'$.question_types',json('[\"数学题\",\"填空题\"]')),'$.question_labels_version') WHERE id=?1",[first]).unwrap();
+        let latest=e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
+        assert_eq!(latest["questions"].as_array().unwrap().len(),5);
+        assert!(latest["questions"][0]["question_types"].as_array().unwrap().contains(&json!("最大公因数题")));
+        for (i,tag) in [(0,"最大公因数题"),(1,"最小公倍数题"),(2,"质数合数题"),(3,"商积比较题"),(4,"四则混合运算题")] {
+            let result=e.wrong_practice(json!({"action":"turn","query":format!("给梁子航出一道最新上传的{tag}"),"session_id":tag})).await.unwrap();
+            assert_eq!(result["question_id"],imported["ids"][i],"{tag}: {result}");
+        }
+        assert!(!query_types("梁子航有多少最大公因数错题").is_empty());
+        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"宋娜娜"})).await.unwrap()["ok"],false);
     }
     #[test]
     fn operation_labels_overlap_and_ignore_answers_fractions_and_grading_crosses() {

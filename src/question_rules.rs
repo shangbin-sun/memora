@@ -21,7 +21,7 @@ pub(crate) fn classify(text:&str,heading:&str)->Classification {
     let fraction=Regex::new(r"\d+\s*/\s*\d+").unwrap().is_match(body) || has(body,&["分数","分子","分母","通分"]);
     let geometry=has(body,&["周长","面积","三角形","正方形","长方形","平行四边形","内角","圆的","半径","直径","体积"]);
     let numeric=has(body,&["自然数","质数","合数","偶数","奇数","位数","最接近","大小关系","数轴","整除","倍数","因数"]);
-    let time=has(body,&["几点","小时","分钟","时刻","到达时间"]);
+    let time=has(body,&["几点","小时","分钟","时刻","到达时间"]) && !has(body,&["每小时行驶","平均每小时"]);
     let units=has(body,&["换算","平方米=","平方厘米=","米=","厘米=","千克=","克=","升=","毫升="]);
     // 题号先去掉；操作数允许字母，纯数字分数的/独立处理。
     let stem=Regex::new(r"^\s*\d{1,3}\s*[.．、。]\s*").unwrap().replace(body,"");
@@ -34,6 +34,8 @@ pub(crate) fn classify(text:&str,heading:&str)->Classification {
     let mut multiply=op("×✕*")||Regex::new(r"[0-9)）]\s*[xX]\s*[0-9(（]").unwrap().is_match(&stem)||has(&singles,&["乘法","乘以","相乘"]);
     let mut divide=op("÷")||has(&singles,&["除法","除以","相除","平均分","均分","平分"])
         || (has(&stem,&["计算","求值"]) && op("/"));
+    let application=has(&stem,&["苹果","小朋友","每人","每袋","火车","彩带","汽车","每盒彩笔","找回多少"]);
+    if application && has(&stem,&["每段","平均每小时","可以剪成","能剪成"]) {divide=true;}
     let computation=has(&stem,&["多少","求","计算"]);
     if geometry && computation && Regex::new(r"\d").unwrap().is_match(&stem) {
         let inverse=Regex::new(r"(?:周长|面积|体积).{0,18}(?:求|多少|几)(?:.{0,5})(?:边长|宽|长|高)|(?:求|计算)(?:边长|宽|长|高)").unwrap().is_match(&stem);
@@ -55,7 +57,12 @@ pub(crate) fn classify(text:&str,heading:&str)->Classification {
     for (on,tag) in [(geometry,"几何题"),(fraction,"分数题"),(numeric,"数的认识题"),(time,"时间计算题"),(units,"单位换算题"),(plus,"加法题"),(minus,"减法题"),(plus||minus||mixed_add,"加减法题"),(multiply,"乘法题"),(divide,"除法题"),(multiply||divide||mixed_mul,"乘除法题"),(plus||minus||multiply||divide||mixed_add||mixed_mul,"算术题")] {
         if on && !language {add(&mut out.required,tag);}
     }
-    if (divide||multiply||plus||minus) && has(&stem,&["苹果","小朋友","每人","每袋","火车"]) {add(&mut out.required,"应用题");}
+    if application {add(&mut out.required,"数学题");add(&mut out.required,"应用题");}
+    let decimal=Regex::new(r"\d+\.\d+").unwrap().is_match(&stem) || has(&stem,&["小数"]);
+    let compare=Regex::new(r"(?:积|商).{0,8}比|积与.{0,12}相比").unwrap().is_match(&stem);
+    for (on,tag) in [(decimal,"小数题"),(has(&stem,&["最大公因数"]),"最大公因数题"),(has(&stem,&["最小公倍数"]),"最小公倍数题"),(has(&stem,&["因数","倍数"]),"因数倍数题"),(has(&stem,&["质数","合数"]),"质数合数题"),(stem.contains("位小数"),"小数位数题"),(compare,"商积比较题"),((plus||minus)&&(multiply||divide),"四则混合运算题")] {
+        if on && !language {add(&mut out.required,"数学题");add(&mut out.required,tag);}
+    }
     // 明确单一运算或非运算概念不接受模型凭空附加其他运算。
     if math && ((plus||minus||multiply||divide) || numeric || fraction || units || (geometry&&!computation)) {
         for (on,tag) in [(plus,"加法题"),(minus,"减法题"),(plus||minus||mixed_add,"加减法题"),(multiply,"乘法题"),(divide,"除法题"),(multiply||divide||mixed_mul,"乘除法题")] {if !on {out.forbidden.push(tag);}}
@@ -74,6 +81,24 @@ pub(crate) fn validate_model(tags:&[String],rules:&Classification)->Option<Vec<S
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn fifth_grade_labels_use_question_not_child_answer() {
+  for (text,yes,no) in [
+   ("7.56÷1.8\n孩子答案：4.02",vec!["小数题","除法题"],vec!["应用题"]),
+   ("24和36的最大公因数是（ ）。\n孩子答案：6",vec!["最大公因数题","因数倍数题","填空题"],vec!["算术题"]),
+   ("9和12的最小公倍数是（ ）。",vec!["最小公倍数题","因数倍数题"],vec!["除法题"]),
+   ("最小的合数是（ ）。",vec!["质数合数题"],vec!["小数题"]),
+   ("0.56×0.9的积是（ ）位小数",vec!["小数题","小数位数题"],vec!["商积比较题"]),
+   ("7.8÷1.3的商比7.8（ ）。",vec!["小数题","商积比较题"],vec!["时间计算题"]),
+   ("一根彩带长7.2米，每段剪成0.6米，可以剪成几段？",vec!["小数题","应用题","除法题"],vec!["时间计算题"]),
+   ("一辆汽车1.2小时行驶45.6千米，平均每小时行驶多少千米？",vec!["小数题","应用题","除法题"],vec!["时间计算题"]),
+   ("（8.4-2.4）÷1.5\n孩子答案：6",vec!["四则混合运算题","小数题"],vec!["乘法题"]),
+   ("2×2\n孩子答案：40.0 最大公因数 解析：0.2÷3",vec!["乘法题"],vec!["小数题","最大公因数题"]),
+  ] {
+   let r=classify(text,"");for tag in yes {assert!(r.tags.iter().any(|t|t==tag),"{text}: missing {tag}, {r:?}");}
+   for tag in no {assert!(!r.tags.iter().any(|t|t==tag),"{text}: extra {tag}, {r:?}");}
+  }
+ }
  #[test]
  fn generalizes_across_operations_and_word_problems_without_using_answer_fields() {
   for (text,yes,no) in [
