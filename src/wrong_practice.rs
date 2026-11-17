@@ -658,7 +658,10 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         let equation = Regex::new(r"^\d+[.．、。]\s*").unwrap().replace(raw_q, "");
         let equation = equation.trim().strip_suffix("答错").unwrap_or(equation.trim()).trim();
         // 新的多题图片永不计算；旧单道口算只在调用方明确打开开关时计算。
-        let observation_image = image && ["# 错题原文（仅转录）", "# 图片错题（圈选）", "# 图片错题（题目与孩子答案）"].iter().any(|header|text.starts_with(header));
+        // 仅题目与孩子答案的新预设按原文保存，不补解析、不截断多行步骤。
+        let observation_preset = body["preset_labels_required"] == true
+            && !has(raw_q, &["正确答案：", "正确答案:", "解析：", "解析:"]);
+        let observation_image = observation_preset || (image && ["# 错题原文（仅转录）", "# 图片错题（圈选）", "# 图片错题（题目与孩子答案）"].iter().any(|header|text.starts_with(header)));
         let calculate_image = image && text.starts_with("# 错题原文（仅转录）")
             && body["calculate_arithmetic_answers"].as_bool().unwrap_or(false);
         let calculated = if !observation_image || calculate_image { crate::arithmetic::check(equation) } else { None };
@@ -2041,6 +2044,103 @@ mod question_label_tests {
         e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
         assert_eq!(load(&conn,"default").unwrap()[0].meta["question_types"],q[0].meta["question_types"]);
         assert_eq!(r["count"],1);
+    }
+    #[tokio::test]
+    async fn fifth_grade_presets_keep_full_answers_without_numbers_or_explanations() {
+        let (_d,e,path)=setup().await;
+        let text=r###"# 错题集
+
+姓名：梁子航
+
+<!-- question_tags: {"number": 1, "tags": ["数学题", "算术题", "小数题", "除法题", "乘除法题"]} -->
+**1.** 计算：9.36÷1.2。
+
+**孩子答案：0.78**
+
+<!-- question_tags: {"number": 2, "tags": ["数学题", "应用题", "算术题", "乘法题", "除法题", "乘除法题", "减法题", "加减法题"]} -->
+**2.** 鸡和兔在同一个笼子里，共有24只，共有64只脚。鸡和兔各有多少只？
+
+**孩子答案：**
+假设全是鸡，脚的总数是24×2＝48（只）。
+实际比假设多64－48＝16（只）脚。
+每只兔有4只脚，所以兔有16÷4＝4（只）。
+鸡有24－4＝20（只）。
+答：鸡有20只，兔有4只。
+
+<!-- question_tags: {"number": 3, "tags": ["数学题", "算术题", "小数题", "除法题", "乘除法题"]} -->
+**3.** 计算：14.4÷0.24。
+
+**孩子答案：6**
+
+<!-- question_tags: {"number": 4, "tags": ["数学题", "填空题", "几何题", "算术题", "乘法题", "乘除法题"]} -->
+**4.** 一个平行四边形的底是12厘米，这条底对应的高是7厘米，另一条边长8厘米。它的面积是（　）平方厘米。
+
+**孩子答案：96**
+
+<!-- question_tags: {"number": 5, "tags": ["数学题", "应用题", "算术题", "乘法题", "除法题", "乘除法题", "加法题", "减法题", "加减法题"]} -->
+**5.** 公园成人票每张10元，儿童票每张6元。一共卖出32张票，收入256元。成人票和儿童票各卖出多少张？
+
+**孩子答案：**
+假设卖出的全是儿童票，收入是32×6＝192（元）。
+实际比假设多收入256－192＝64（元）。
+一张成人票和一张儿童票合计10＋6＝16（元）。
+成人票卖出64÷16＝4（张）。
+儿童票卖出32－4＝28（张）。
+答：成人票卖出4张，儿童票卖出28张。
+
+<!-- question_tags: {"number": 6, "tags": ["数学题", "算术题", "小数题", "除法题", "乘除法题"]} -->
+**6.** 计算：6.84÷1.8。
+
+**孩子答案：3.08**
+
+<!-- question_tags: {"number": 7, "tags": ["数学题", "选择题"]} -->
+**7.** 方程4x＋6＝38的解是（　）。
+
+A. x＝6　B. x＝8　C. x＝10　D. x＝11
+
+**孩子答案：C**
+
+<!-- question_tags: {"number": 8, "tags": ["数学题", "应用题", "算术题", "乘法题", "除法题", "乘除法题", "减法题", "加减法题"]} -->
+**8.** 老师买了两种笔，共30支。签字笔每支3元，铅笔每支2元，共花了78元。两种笔各买了多少支？
+
+**孩子答案：**
+假设全买签字笔，需要30×3＝90（元）。
+比实际多花90－78＝12（元）。
+每支签字笔3元，所以铅笔买了12÷3＝4（支）。
+签字笔买了30－4＝26（支）。
+答：签字笔买了26支，铅笔买了4支。
+
+<!-- question_tags: {"number": 9, "tags": ["数学题", "算术题", "小数题", "除法题", "乘除法题"]} -->
+**9.** 计算：5.46÷0.35。
+
+**孩子答案：1.56**
+
+<!-- question_tags: {"number": 10, "tags": ["数学题", "选择题"]} -->
+**10.** 袋子里有5个红球、3个蓝球和2个黄球，除颜色外完全相同。从中任意摸出一个球，下面说法正确的是（　）。
+
+A. 摸到红球的可能性最大　B. 摸到蓝球的可能性最大
+C. 摸到黄球的可能性最大　D. 摸到三种颜色球的可能性一样大
+
+**孩子答案：B**
+"###;
+        let result=e.wrong_practice(json!({"action":"import","text":text,"source_id":"preset:test","preset_labels_required":true})).await.unwrap();
+        assert_eq!(result["count"],10);
+        let conn=Connection::open(&path).unwrap();
+        let rows=load(&conn,"default").unwrap();
+        assert_eq!(rows.len(),10);
+        for row in &rows {
+            assert!(!Regex::new(r"^\s*\d+[.．、。]").unwrap().is_match(&row.raw),"{}",row.raw);
+            assert!(!row.raw.contains("解析："),"{}",row.raw);
+            assert!(!row.raw.contains("正确答案："),"{}",row.raw);
+            assert!(!row.raw.contains("没答上"),"{}",row.raw);
+            assert!(row.raw.contains("孩子答案："));
+            if [2,5,8].contains(&row.number) {
+                let child=row.meta["child_answer"].as_str().unwrap();
+                assert!(child.contains("假设"),"{child}");
+                assert!(child.contains("答："),"{child}");
+                assert!(child.lines().count()>=5,"{child}");
+            }
+        }
     }
     #[tokio::test]
     async fn missing_preset_tags_reject_instead_of_running_rules() {
