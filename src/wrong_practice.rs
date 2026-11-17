@@ -17,100 +17,15 @@ fn norm(s: &str) -> String {
         .flat_map(char::to_lowercase)
         .collect()
 }
-const QUESTION_TAGS: &[&str] = &["数学题","语文题","选择题","判断题","填空题","算术题","几何题","古诗题","加法题","减法题","加减法题","乘法题","除法题","乘除法题","分数题","时间计算题","单位换算题","数的认识题","应用题","小数题","最大公因数题","最小公倍数题","因数倍数题","质数合数题","小数位数题","商积比较题","四则混合运算题"];
-
-fn validated_question_tags(value: &Value) -> Option<Vec<String>> {
-    let values=value.as_array()?;
-    if !(2..=12).contains(&values.len()) {return None;}
-    let mut tags=Vec::new();
-    for value in values {
-        let tag=value.as_str()?;
-        if !QUESTION_TAGS.contains(&tag) {return None;}
-        if !tags.iter().any(|t|t==tag) {tags.push(tag.to_string());}
+pub(crate) fn refresh_edited_question(rec: &mut MemoryRecord) {
+    let text = clean(&rec.content);
+    let child = observed_child_answer(&text, "");
+    rec.content = compact_record(&text, &child);
+    rec.metadata["child_answer"] = json!(child);
+    rec.metadata["question_edited"] = json!(true);
+    if let Some(meta) = rec.metadata.as_object_mut() {
+        meta.remove("last_presented_upload_ms");
     }
-    if !tags.iter().any(|t|t=="数学题" || t=="语文题") {return None;}
-    Some(tags)
-}
-
-fn resolved_question_labels(entry: &Value, text: &str, heading: &str) -> Value {
-    if entry["question_label_source"]=="edge_model" {
-        if let Some(mut tags)=validated_question_tags(&entry["question_types"]) {
-            for (children,parent) in [(["加法题","减法题"],"加减法题"),(["乘法题","除法题"],"乘除法题")] {
-                if tags.iter().any(|t|children.contains(&t.as_str())) {
-                    for tag in [parent,"算术题"] {if !tags.iter().any(|t|t==tag) {tags.push(tag.into());}}
-                }
-            }
-            let rules=crate::question_rules::classify(text,heading);
-            if let Some(corrected)=crate::question_rules::validate_model(&tags,&rules) {
-                return json!({"question_types":corrected,"question_label_source":"rules_corrected","question_label_reason":"model_conflicts_with_question_evidence"});
-            }
-            return json!({"question_types":tags,"question_label_source":"edge_model","question_label_reason":null});
-        }
-    }
-    json!({"question_types":labels(text,heading),"question_label_source":"rules_fallback","question_label_reason":entry["question_label_reason"].as_str().unwrap_or("missing_or_invalid_model_labels")})
-}
-
-pub(crate) fn relabel_edited_question(rec: &mut MemoryRecord, patch: Option<&Value>) {
-    let current_patch=patch.filter(|p|p["question_label_text"].as_str()==Some(rec.content.as_str()));
-    let resolved=resolved_question_labels(current_patch.unwrap_or(&Value::Null),&rec.content,"");
-    for key in ["question_types","question_label_source","question_label_reason"] {rec.metadata[key]=resolved[key].clone();}
-    rec.metadata["arithmetic_labels_version"]=json!(1);
-    rec.metadata["question_edited"]=json!(true);
-    rec.metadata["answer"]=json!(answer(&rec.content));
-    rec.metadata["child_answer"]=json!(child_answer(&rec.content,""));
-    if let Some(meta)=rec.metadata.as_object_mut() {meta.remove("last_presented_upload_ms");}
-}
-
-#[cfg(test)]
-fn arithmetic_labels(text: &str) -> Vec<String> {
-    crate::question_rules::classify(text,"").tags.into_iter().filter(|t|["加法题","减法题","加减法题","乘法题","除法题","乘除法题"].contains(&t.as_str())).collect()
-}
-
-// 升级用户上传旧题只补标签，不改正文、上传时间、显式预设标签或UI排序。
-fn refresh_arithmetic_labels(conn: &Connection, ns: &str, jieba: &jieba_rs::Jieba) -> Result<()> {
-    for q in load(conn,ns)? {
-        if q.meta["question_labels_version"] == 3 || q.meta["question_label_source"] == "preset" { continue; }
-        let id=Uuid::parse_str(&q.id).map_err(|e|crate::error::MemoraError::InvalidState(e.to_string()))?;
-        let Some(mut rec)=store::get_memory(conn,id)? else { continue; };
-        let source=if rec.metadata["question_edited"]==true {rec.content.as_str()} else {rec.metadata["original_text"].as_str().unwrap_or(&rec.content)};
-        let rules=crate::question_rules::classify(source, "");
-        let mut tags:Vec<Value>=rec.metadata["question_types"].as_array().cloned().unwrap_or_default().into_iter()
-            .filter(|tag|!rules.forbidden.contains(&tag.as_str().unwrap_or(""))).collect();
-        for tag in rules.tags {
-            if !tags.contains(&json!(tag)) { tags.push(json!(tag)); }
-        }
-        if tags.iter().any(|t| matches!(t.as_str(),Some("加法题"|"减法题"|"乘法题"|"除法题"))) && !tags.contains(&json!("算术题")) { tags.push(json!("算术题")); }
-        rec.metadata["question_types"]=json!(tags);
-        rec.metadata["arithmetic_labels_version"]=json!(1);
-        rec.metadata["question_labels_version"]=json!(3);
-        store::update_memory(conn,&mut rec,jieba)?;
-    }
-    Ok(())
-}
-
-fn labels(text: &str, heading: &str) -> Vec<String> {
-    crate::question_rules::classify(text,heading).tags
-}
-fn answer(text: &str) -> String {
-    // 已知资料勘误：保留事实原文，判题元数据明确记录修正。
-    if text.contains("千锤万凿出深山") {
-        return "粉骨碎身浑不怕".into();
-    }
-    if text.contains("咬定青山不放松") {
-        return "任尔东西南北风".into();
-    }
-    Regex::new(r"(?:正确答案|(?:^|[\s　])答案)[：:]\s*([^\n　（(]+)")
-        .unwrap()
-        .captures(text)
-        .map(|c| {
-            let answer = c[1].split("解析").next().unwrap_or("").trim();
-            if answer.starts_with(['A', 'B', 'C', 'D']) {
-                answer.chars().next().unwrap().to_string()
-            } else {
-                answer.trim_end_matches(['。', '，', '!', '！']).to_string()
-            }
-        })
-        .unwrap_or_default()
 }
 #[derive(Debug)]
 struct ChoiceSpan {
@@ -183,9 +98,14 @@ fn question(text: &str) -> String {
             .iter()
             .map(|option| {
                 let body = &t[option.body_start..option.end];
-                let value = if mark.find(body).is_some_and(|m| !body[..m.start()].trim().is_empty()) {
+                let value = if mark
+                    .find(body)
+                    .is_some_and(|m| !body[..m.start()].trim().is_empty())
+                {
                     mark.replace(body, "")
-                } else { std::borrow::Cow::Borrowed(body) };
+                } else {
+                    std::borrow::Cow::Borrowed(body)
+                };
                 format!("{}. {}", option.label, value.trim())
             })
             .collect();
@@ -194,10 +114,17 @@ fn question(text: &str) -> String {
     Regex::new(r"[（(][√×][）)]|[×✗❌]")
         .unwrap()
         .replace_all(t, |caps: &regex::Captures| {
-            let m=caps.get(0).unwrap();
-            let left=t[..m.start()].chars().rev().find(|c|!c.is_whitespace());
-            let right=t[m.end()..].chars().find(|c|!c.is_whitespace());
-            if m.as_str()=="×" && left.is_some_and(|c|c.is_ascii_digit() || c==')' || c=='）') && right.is_some_and(|c|c.is_ascii_digit() || c=='(' || c=='（') { "×" } else { "（ ）" }
+            let m = caps.get(0).unwrap();
+            let left = t[..m.start()].chars().rev().find(|c| !c.is_whitespace());
+            let right = t[m.end()..].chars().find(|c| !c.is_whitespace());
+            if m.as_str() == "×"
+                && left.is_some_and(|c| c.is_ascii_digit() || c == ')' || c == '）')
+                && right.is_some_and(|c| c.is_ascii_digit() || c == '(' || c == '（')
+            {
+                "×"
+            } else {
+                "（ ）"
+            }
         })
         .to_string()
 }
@@ -205,7 +132,9 @@ fn question(text: &str) -> String {
 // 图片观察正文已经由调用方分题；保留全部作答行，不以答案语法或占位词拒绝落盘。
 fn observed_child_answer(text: &str, heading: &str) -> String {
     if let Some(found) = Regex::new(r"孩子答案[：:]").unwrap().find(text) {
-        return text[found.end()..].trim().trim_end_matches('*').trim().to_string();
+        return before_reference_fields(&text[found.end()..])
+            .trim()
+            .to_string();
     }
     child_answer(text, heading)
 }
@@ -260,58 +189,25 @@ fn child_answer(text: &str, heading: &str) -> String {
     if marked.len() == 1 {
         return marked[0].to_string();
     }
-    if has(text, &["东南西北"]) {
-        return "任尔东南西北风".into();
-    }
     let _ = heading;
     "没答上".into()
 }
-fn explanation(text: &str) -> Option<String> {
-    for label in ["订正", "訂正", "改正", "更正", "解析"] {
-        let re = Regex::new(&format!(r"{}[：:][ \t]*", label)).unwrap();
-        if let Some(found) = re.find(text) {
-            let value = before_answer_fields(&text[found.end()..])
-                .trim()
-                .trim_end_matches('*')
-                .trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
+fn before_reference_fields(text: &str) -> &str {
+    Regex::new(r"(?:订正|訂正|改正|更正|正确答案|标准答案|参考答案|解析)[：:]")
+        .unwrap()
+        .find(text)
+        .map(|m| &text[..m.start()])
+        .unwrap_or(text)
 }
-fn compact_record(text: &str, correct: &str, child: &str) -> String {
-    compact_record_for_source(text, correct, child, false)
-}
-fn compact_record_for_source(text: &str, correct: &str, child: &str, image: bool) -> String {
-    let text = text.split("练习题面：").last().unwrap_or(text);
+fn compact_record(text: &str, child: &str) -> String {
     let text = Regex::new(r"^\s*\d+[.．、。]\s*")
         .unwrap()
         .replace(text, "");
     let stem = question(&text);
-    let stem = Regex::new(r"_+").unwrap().replace_all(&stem, "（ ）");
-    let stem = stem.trim().trim_end_matches('*').trim();
-    let extracted_explanation = explanation(&text).or_else(|| {
-        if image { return None; }
-        let source = Regex::new(r"[（(]([^（）()]*《[^》]+》)[）)]").unwrap()
-            .captures(&text).map(|c| c[1].to_string()).unwrap_or_default();
-        Some(if source.is_empty() { "按题意核对正确答案。".to_string() } else { format!("{}。", source) })
-    });
-    let stem = Regex::new(r"\s*([ABCD][.．、])\s*")
-        .unwrap()
-        .replace_all(stem, "　$1 ");
-    // 选项横排，具体换行由UI按实际测量宽度处理。
-    let stem = stem.replace("　A.", "\nA.");
-    let mut fields = format!("**孩子答案：{child}");
-    if !correct.is_empty() { fields.push_str(&format!("　正确答案：{correct}")); }
-    fields.push_str("**");
-    if let Some(explanation) = extracted_explanation { fields.push_str(&format!("　解析：{explanation}")); }
-    format!("{}\n{}", stem.trim(), fields)
+    format!("{}\n**孩子答案：** {}", stem.trim(), child.trim())
 }
 fn question_key(text: &str) -> String {
     let stem = question(text).replace("每个小朋友分到几个苹果", "每人分到几个");
-    let stem = Regex::new(r"^(?:加法题|减法题|加减法题|乘法题|除法题|乘除法题|算术题)\s+").unwrap().replace(&stem, "");
     let stem = Regex::new(r"^\s*\d+[.．、。]\s*(?:选择题[：:]\s*)?")
         .unwrap()
         .replace(&stem, "");
@@ -381,7 +277,10 @@ fn load(conn: &Connection, ns: &str) -> Result<Vec<Q>> {
     for row in rows {
         let (id, raw, m) = row?;
         let meta: Value = serde_json::from_str(&m)?;
-        if meta["practice_kind"] == "question" && meta["display_only"] != true && meta["record_type"] != "practice_results" {
+        if meta["practice_kind"] == "question"
+            && meta["display_only"] != true
+            && meta["record_type"] != "practice_results"
+        {
             out.push(Q {
                 id,
                 number: meta["number"].as_i64().unwrap_or(0),
@@ -391,14 +290,6 @@ fn load(conn: &Connection, ns: &str) -> Result<Vec<Q>> {
         }
     }
     Ok(out)
-}
-fn view(q: &Q) -> String {
-    let raw = if q.meta["image"] == true {
-        q.raw.split("练习题面：").last().unwrap_or(&q.raw)
-    } else {
-        &q.raw
-    };
-    format!("第{}题：{}", q.number, question(raw))
 }
 fn save_state(tx: &Connection, ns: &str, sid: &str, state: &Value) -> Result<()> {
     tx.execute("INSERT INTO wrong_practice_sessions(namespace,session_id,state) VALUES(?1,?2,?3) ON CONFLICT(namespace,session_id) DO UPDATE SET state=excluded.state", params![ns,sid,state.to_string()])?;
@@ -414,7 +305,6 @@ pub fn execute(
     let start = std::time::Instant::now();
     conn.execute_batch("CREATE TABLE IF NOT EXISTS wrong_practice_sessions(namespace TEXT NOT NULL,session_id TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(namespace,session_id)); CREATE TABLE IF NOT EXISTS wrong_practice_turns(namespace TEXT NOT NULL,session_id TEXT NOT NULL,message_id TEXT NOT NULL,reply TEXT NOT NULL,PRIMARY KEY(namespace,session_id,message_id));")?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    refresh_arithmetic_labels(&tx, ns, jieba)?;
     let mut result = if body["action"] == "family_seed" {
         let mut seeded = crate::family_demo::seed(&tx, ns, jieba, &body)?;
         if seeded["already_seeded"] != true {
@@ -423,7 +313,7 @@ pub fn execute(
                     &tx,
                     ns,
                     jieba,
-                    &json!({"text":text,"source_id":"preset:wrong_questions","name":"错题集.md","kind":"document","preset_labels_required":true}),
+                    &json!({"text":text,"source_id":"preset:wrong_questions","name":"错题集.md","kind":"document"}),
                 )?;
                 if imported["handled"] != true || imported["error"].is_string() {
                     return Err(crate::error::MemoraError::InvalidState(
@@ -454,125 +344,281 @@ pub fn execute(
     Ok(result)
 }
 fn required_person_name(body: &Value) -> Result<&str> {
-    let name = body["name"].as_str().map(str::trim).filter(|n| !n.is_empty() && n.chars().count() <= 40 && !n.chars().any(char::is_control));
-    name.ok_or_else(|| crate::error::MemoraError::InvalidState("name必须为1至40字的有效人物姓名字符串".into()))
+    let name = body["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.chars().count() <= 40 && !n.chars().any(char::is_control));
+    name.ok_or_else(|| {
+        crate::error::MemoraError::InvalidState("name必须为1至40字的有效人物姓名字符串".into())
+    })
 }
 
 fn person_owner(conn: &Connection, ns: &str, name: &str) -> Result<Option<String>> {
     let members = household::list_members(conn, ns)?;
     // 正式姓名优先；没有正式姓名匹配时才接受唯一别名，不做跨人的模糊匹配。
     let exact: Vec<_> = members.iter().filter(|m| m.display_name == name).collect();
-    let owners = if exact.is_empty() { members.iter().filter(|m| m.aliases.iter().any(|a| a == name)).collect() } else { exact };
+    let owners = if exact.is_empty() {
+        members
+            .iter()
+            .filter(|m| m.aliases.iter().any(|a| a == name))
+            .collect()
+    } else {
+        exact
+    };
     if owners.len() > 1 {
-        return Err(crate::error::MemoraError::InvalidState(format!("{name}匹配多个成员，无法确定归属")));
+        return Err(crate::error::MemoraError::InvalidState(format!(
+            "{name}匹配多个成员，无法确定归属"
+        )));
     }
     Ok(owners.first().map(|m| m.member_id.clone()))
 }
 
 fn latest_uploaded_questions(conn: &Connection, ns: &str, body: &Value) -> Result<Value> {
     let name = required_person_name(body)?;
-    let Some(owner) = person_owner(conn, ns, name)? else { return Ok(json!({"ok":false,"error":format!("未找到{name}最近上传的错题")})); };
+    if body
+        .as_object()
+        .is_some_and(|o| o.keys().any(|k| !["action", "name"].contains(&k.as_str())))
+    {
+        return Err(crate::error::MemoraError::InvalidState(
+            "错题读取只接受name参数".into(),
+        ));
+    }
+    let Some(owner) = person_owner(conn, ns, name)? else {
+        return Ok(json!({"ok":false,"error":format!("未找到{name}最近上传的错题")}));
+    };
     let all = load(conn, ns)?;
-    let source_of = |q: &Q| q.meta["latest_source_id"].as_str().or(q.meta["source_id"].as_str()).unwrap_or("").to_string();
-    let upload_of = |q: &Q| q.meta["latest_upload_id"].as_str().map(str::to_string).unwrap_or_else(|| source_of(q));
-    let mut questions: Vec<_> = all.iter().filter(|q| q.meta["subjects"][0]["member_id"] == owner && !household::is_privacy(&q.meta)
-        && !source_of(q).is_empty() && !source_of(q).starts_with("preset:")).collect();
+    let source_of = |q: &Q| {
+        q.meta["latest_source_id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let upload_of = |q: &Q| {
+        q.meta["latest_upload_id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut questions: Vec<_> = all
+        .iter()
+        .filter(|q| {
+            q.meta["subjects"][0]["member_id"] == owner
+                && !household::is_privacy(&q.meta)
+                && !source_of(q).is_empty()
+                && !source_of(q).starts_with("preset:")
+        })
+        .collect();
     questions.sort_by_key(|q| (q.meta["uploaded_at_ms"].as_i64().unwrap_or(0), q.id.clone()));
-    let Some(latest) = questions.last() else { return Ok(json!({"ok":false,"error":format!("未找到{name}最近上传的错题")})); };
+    let Some(latest) = questions.last() else {
+        return Ok(json!({"ok":false,"error":format!("未找到{name}最近上传的错题")}));
+    };
     let upload = upload_of(latest);
     questions.retain(|q| upload_of(q) == upload);
-    questions.sort_by_key(|q| (q.meta["source_order"].as_i64().unwrap_or(0),q.number,q.id.clone()));
+    questions.sort_by_key(|q| {
+        (
+            q.meta["source_order"].as_i64().unwrap_or(0),
+            q.number,
+            q.id.clone(),
+        )
+    });
     // 原文是记忆事实正文：保持每条content逐字不变，仅以换行连接多条事实。
     let contents: Vec<_> = questions.iter().map(|q| q.raw.as_str()).collect();
-    let questions: Vec<_> = questions.iter().map(|q|json!({"question_id":q.id,"content":q.raw,"question_types":q.meta["question_types"]})).collect();
+    let questions: Vec<_> = questions
+        .iter()
+        .map(|q| json!({"question_id":q.id,"content":q.raw}))
+        .collect();
     Ok(json!({"ok":true,"content":contents.join("\n"),"questions":questions,"upload_id":upload}))
 }
 
 fn delete_question(conn: &Connection, ns: &str, body: &Value) -> Result<Value> {
-    let name=required_person_name(body)?;
-    let question=body["question"].as_str().filter(|v|!v.trim().is_empty()).ok_or_else(||crate::error::MemoraError::InvalidState("question必须为非空题目字符串".into()))?;
-    if body.get("question_id").is_some_and(|id|!id.is_null() && !id.is_string()) { return Err(crate::error::MemoraError::InvalidState("question_id必须为字符串".into())); }
-    let Some(owner)=person_owner(conn,ns,name)? else {return Ok(json!({"ok":false,"error":"未找到对应人物的错题"}));};
-    let bank:Vec<_>=load(conn,ns)?.into_iter().filter(|q|q.meta["subjects"].as_array().is_some_and(|a|a.iter().any(|s|s["member_id"]==owner)) && !household::is_privacy(&q.meta)).collect();
-    let mut matches:Vec<_>=body["question_id"].as_str().filter(|id|!id.is_empty()).map(|id|bank.iter().filter(|q|q.id==id).collect()).unwrap_or_default();
-    let by_id=!matches.is_empty();
-    if matches.is_empty() { matches=bank.iter().filter(|q|q.raw.contains(question)).collect(); }
-    if matches.is_empty() {return Ok(json!({"ok":false,"error":"未找到正文包含该子串的错题，未删除"}));}
-    if matches.len()!=1 {return Ok(json!({"ok":false,"error":"题目子串匹配到多道错题，请提供question_id，未删除","matched_count":matches.len()}));}
-    let q=matches[0];
-    let id=Uuid::parse_str(&q.id).map_err(|e|crate::error::MemoraError::InvalidState(e.to_string()))?;
-    crate::graph::store::withdraw_facts_by_source_memory(conn,ns,id)?;
-    store::delete_memory(conn,id)?;
+    let name = required_person_name(body)?;
+    let question = body["question"]
+        .as_str()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            crate::error::MemoraError::InvalidState("question必须为非空题目字符串".into())
+        })?;
+    if body
+        .get("question_id")
+        .is_some_and(|id| !id.is_null() && !id.is_string())
+    {
+        return Err(crate::error::MemoraError::InvalidState(
+            "question_id必须为字符串".into(),
+        ));
+    }
+    let Some(owner) = person_owner(conn, ns, name)? else {
+        return Ok(json!({"ok":false,"error":"未找到对应人物的错题"}));
+    };
+    let bank: Vec<_> = load(conn, ns)?
+        .into_iter()
+        .filter(|q| {
+            q.meta["subjects"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|s| s["member_id"] == owner))
+                && !household::is_privacy(&q.meta)
+        })
+        .collect();
+    let mut matches: Vec<_> = body["question_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(|id| bank.iter().filter(|q| q.id == id).collect())
+        .unwrap_or_default();
+    let by_id = !matches.is_empty();
+    if matches.is_empty() {
+        matches = bank.iter().filter(|q| q.raw.contains(question)).collect();
+    }
+    if matches.is_empty() {
+        return Ok(json!({"ok":false,"error":"未找到正文包含该子串的错题，未删除"}));
+    }
+    if matches.len() != 1 {
+        return Ok(
+            json!({"ok":false,"error":"题目子串匹配到多道错题，请提供question_id，未删除","matched_count":matches.len()}),
+        );
+    }
+    let q = matches[0];
+    let id = Uuid::parse_str(&q.id)
+        .map_err(|e| crate::error::MemoraError::InvalidState(e.to_string()))?;
+    crate::graph::store::withdraw_facts_by_source_memory(conn, ns, id)?;
+    store::delete_memory(conn, id)?;
     conn.execute("UPDATE wrong_practice_sessions SET state='{}' WHERE namespace=?1 AND json_extract(state,'$.current')=?2",params![ns,q.id])?;
     conn.execute("DELETE FROM wrong_practice_turns WHERE namespace=?1 AND CASE WHEN json_valid(reply) THEN json_extract(reply,'$.question_id') ELSE NULL END=?2",params![ns,q.id])?;
-    Ok(json!({"ok":true,"deleted":true,"question_id":q.id,"matched_by":if by_id {"question_id"}else{"substring"}}))
+    Ok(
+        json!({"ok":true,"deleted":true,"question_id":q.id,"matched_by":if by_id {"question_id"}else{"substring"}}),
+    )
 }
 
 fn latest_health_memory(conn: &Connection, ns: &str, body: &Value) -> Result<Value> {
     let name = required_person_name(body)?;
-    let Some(owner) = person_owner(conn, ns, name)? else { return Ok(json!({"ok":false,"error":format!("未找到{name}的医疗健康记忆")})); };
+    let Some(owner) = person_owner(conn, ns, name)? else {
+        return Ok(json!({"ok":false,"error":format!("未找到{name}的医疗健康记忆")}));
+    };
     // 与UI事实列表使用相同的最新排序，排除摘要、规律及隐藏项。
     let mut stmt = conn.prepare("SELECT id FROM memories WHERE namespace=?1 AND tag='医疗健康' AND (state='active' OR (state='archived' AND json_extract(metadata_json,'$.recall_archived')=1)) AND kind NOT IN ('summary','pattern') ORDER BY updated_at_ms DESC,id DESC")?;
-    let ids = stmt.query_map([ns], |r| r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let ids = stmt
+        .query_map([ns], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let members = household::list_members(conn, ns)?;
-    let display_name = members.iter().find(|m| m.member_id == owner).map(|m| m.display_name.as_str()).unwrap_or(name);
+    let display_name = members
+        .iter()
+        .find(|m| m.member_id == owner)
+        .map(|m| m.display_name.as_str())
+        .unwrap_or(name);
     for id in ids {
-        let id = Uuid::parse_str(&id).map_err(|e| crate::error::MemoraError::InvalidState(e.to_string()))?;
-        let Some(rec) = store::get_memory(conn, id)? else { continue; };
-        if !rec.subject_ids.contains(&owner) || household::is_privacy(&rec.metadata) || rec.metadata["display_only"] == true || rec.metadata["record_type"] == "practice_results" { continue; }
-        if rec.content.trim().is_empty() || (rec.metadata["dream"] == true && rec.metadata["support_count"].as_i64().unwrap_or(0) > 0) { continue; }
-        let has_person = members.iter().any(|m| rec.content.contains(&m.display_name) || m.aliases.iter().any(|a| a.chars().count() >= 2 && rec.content.contains(a)));
-        let content = if has_person { rec.content } else { format!("{display_name}{}",rec.content) };
+        let id = Uuid::parse_str(&id)
+            .map_err(|e| crate::error::MemoraError::InvalidState(e.to_string()))?;
+        let Some(rec) = store::get_memory(conn, id)? else {
+            continue;
+        };
+        if !rec.subject_ids.contains(&owner)
+            || household::is_privacy(&rec.metadata)
+            || rec.metadata["display_only"] == true
+            || rec.metadata["record_type"] == "practice_results"
+        {
+            continue;
+        }
+        if rec.content.trim().is_empty()
+            || (rec.metadata["dream"] == true
+                && rec.metadata["support_count"].as_i64().unwrap_or(0) > 0)
+        {
+            continue;
+        }
+        let has_person = members.iter().any(|m| {
+            rec.content.contains(&m.display_name)
+                || m.aliases
+                    .iter()
+                    .any(|a| a.chars().count() >= 2 && rec.content.contains(a))
+        });
+        let content = if has_person {
+            rec.content
+        } else {
+            format!("{display_name}{}", rec.content)
+        };
         return Ok(json!({"ok":true,"content":content,"id":id}));
     }
     Ok(json!({"ok":false,"error":format!("未找到{name}的医疗健康记忆")}))
 }
 
 /// 宿主工具写入已判定结果，不重新抽取、判题或拆分正文。
-fn record_results(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> Result<Value> {
+fn record_results(
+    tx: &Connection,
+    ns: &str,
+    jieba: &jieba_rs::Jieba,
+    body: &Value,
+) -> Result<Value> {
     let invalid = |message: &str| crate::error::MemoraError::InvalidState(message.into());
     let name = required_person_name(body)?;
-    let rows = body["list"].as_array().filter(|v| !v.is_empty()).ok_or_else(|| invalid("list必须为非空数组"))?;
+    let rows = body["list"]
+        .as_array()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| invalid("list必须为非空数组"))?;
     let mut lines = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let fields = row.as_object().ok_or_else(|| invalid("题目项必须为对象"))?;
-        if fields.len() != 2 { return Err(invalid("每项只接受题目、是否答对两个字段")); }
-        let question = row["题目"].as_str().filter(|v| !v.trim().is_empty()).ok_or_else(|| invalid("题目必须为非空字符串"))?;
-        let correct = row["是否答对"].as_bool().ok_or_else(|| invalid("是否答对必须为布尔值"))?;
-        let prefix = if rows.len() == 1 { String::new() } else { format!("{}.", i + 1) };
-        lines.push(format!("{prefix}{question} **{}**", if correct { "答对" } else { "答错" }));
+        if fields.len() != 2 {
+            return Err(invalid("每项只接受题目、是否答对两个字段"));
+        }
+        let question = row["题目"]
+            .as_str()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| invalid("题目必须为非空字符串"))?;
+        let correct = row["是否答对"]
+            .as_bool()
+            .ok_or_else(|| invalid("是否答对必须为布尔值"))?;
+        let prefix = if rows.len() == 1 {
+            String::new()
+        } else {
+            format!("{}.", i + 1)
+        };
+        lines.push(format!(
+            "{prefix}{question} **{}**",
+            if correct { "答对" } else { "答错" }
+        ));
     }
     let existing = person_owner(tx, ns, name)?;
-    let owner = existing.clone().unwrap_or_else(|| format!("person_{}", Uuid::now_v7()));
+    let owner = existing
+        .clone()
+        .unwrap_or_else(|| format!("person_{}", Uuid::now_v7()));
     if existing.is_none() {
-        household::upsert_member(tx, ns, &household::HouseholdMember {
-            member_id: owner.clone(), display_name: name.into(), role: household::MemberRole::Other,
-            aliases: vec![], age_band: None,
-        })?;
+        household::upsert_member(
+            tx,
+            ns,
+            &household::HouseholdMember {
+                member_id: owner.clone(),
+                display_name: name.into(),
+                role: household::MemberRole::Other,
+                aliases: vec![],
+                age_band: None,
+            },
+        )?;
     }
-    household::upsert_tag(tx, ns, &household::MemoryTag {tag_id: "错题集".into(), display_name: "错题集".into(), aliases: vec![]})?;
+    household::upsert_tag(
+        tx,
+        ns,
+        &household::MemoryTag {
+            tag_id: "错题集".into(),
+            display_name: "错题集".into(),
+            aliases: vec![],
+        },
+    )?;
     let content = lines.join("\n");
-    let id = record(tx, ns, jieba, &owner, &content, json!({
-        "record_type":"practice_results", "display_only":true, "source":"person_incorrect_question_record", "owner_name":name,
-        "subjects":[{"member_id":owner,"confidence":1.0}], "attribution":"manual", "results":rows
-    }), None)?;
+    let id = record(
+        tx,
+        ns,
+        jieba,
+        &owner,
+        &content,
+        json!({
+            "record_type":"practice_results", "display_only":true, "source":"person_incorrect_question_record", "owner_name":name,
+            "subjects":[{"member_id":owner,"confidence":1.0}], "attribution":"manual", "results":rows
+        }),
+        None,
+    )?;
     Ok(json!({"ok":true,"id":id,"content":content,"count":rows.len()}))
 }
 
 fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> Result<Value> {
     let raw = body["text"].as_str().unwrap_or("");
-    let annotations=Regex::new(r"<!-- question_tags: (.*?) -->").unwrap();
-    let mut preset_labels=std::collections::HashMap::new();
-    if body["preset_labels_required"]==true {
-        for cap in annotations.captures_iter(raw) {
-            let entry:Value=serde_json::from_str(&cap[1])?;
-            let number=entry["number"].as_i64().ok_or_else(||crate::error::MemoraError::InvalidState("预设标签缺少题号".into()))?;
-            let tags=validated_question_tags(&entry["tags"]).ok_or_else(||crate::error::MemoraError::InvalidState("预设标签无效".into()))?;
-            if preset_labels.insert(number,tags).is_some() {return Err(crate::error::MemoraError::InvalidState("预设标签题号重复".into()));}
-        }
-    }
-    let raw_without_tags=annotations.replace_all(raw,"");
-    let text = clean(&raw_without_tags);
+    let text = clean(raw);
     if !has(&text, &["错题", "古诗词积累练习", "请补全《竹石》"]) {
         return Ok(json!({"handled":false}));
     }
@@ -622,7 +668,6 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
     }
     let existing = load(tx, ns)?;
     let mut count = 0;
-    let mut skipped_correct = 0;
     let mut ids = Vec::new();
     for (i, c) in matches.iter().enumerate() {
         let number: i64 = c[1].parse().unwrap_or(0);
@@ -632,1093 +677,162 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
             .map(|c| c.get(0).unwrap().start())
             .unwrap_or(text.len());
         let raw_q = text[from..to].split("\n##").next().unwrap_or("").trim();
-        let heading = text[..from]
-            .rsplit("##")
-            .next()
-            .unwrap_or("")
-            .lines()
-            .next()
-            .unwrap_or("");
-        let mut q = raw_q.to_string();
-        // 指定图片只有批改痕迹，原文保留在正文；以空缺题面出题，不能把学生错误作答当答案。
         let image = body["kind"] == "image_ocr";
-        if image && has(raw_q, &["竹石", "咬定青山"]) {
-            q = format!(
-                "{}\n练习题面：咬定青山不放松，立根原在破岩中。千磨万击还坚劲，________。",
-                raw_q
-            );
-        }
-        let mut classification = if body["preset_labels_required"]==true {
-            let tags=preset_labels.get(&number).ok_or_else(||crate::error::MemoraError::InvalidState(format!("预设第{number}题未指定标签")))?;
-            json!({"question_types":tags,"question_label_source":"preset","question_label_reason":null})
-        } else {
-            resolved_question_labels(&body["question_labels"][number.to_string()],raw_q,heading)
-        };
-        // 旧单题口算显式开启时才判题；观察模式不计算，只保留题面和实际作答。
-        let equation = Regex::new(r"^\d+[.．、。]\s*").unwrap().replace(raw_q, "");
-        let equation = equation.trim().strip_suffix("答错").unwrap_or(equation.trim()).trim();
-        // 新的多题图片永不计算；旧单道口算只在调用方明确打开开关时计算。
-        // 仅题目与孩子答案的新预设按原文保存，不补解析、不截断多行步骤。
-        let observation_preset = body["preset_labels_required"] == true
-            && !has(raw_q, &["正确答案：", "正确答案:", "解析：", "解析:"]);
-        let observation_image = observation_preset || (image && ["# 错题原文（仅转录）", "# 图片错题（圈选）", "# 图片错题（题目与孩子答案）"].iter().any(|header|text.starts_with(header)));
-        let calculate_image = image && text.starts_with("# 错题原文（仅转录）")
-            && body["calculate_arithmetic_answers"].as_bool().unwrap_or(false);
-        let calculated = if !observation_image || calculate_image { crate::arithmetic::check(equation) } else { None };
-        if calculate_image && calculated.is_none() {
-            return Err(crate::error::MemoraError::InvalidState("数学表达式无效、超出支持范围或无法安全计算".into()));
-        }
-        if image && !observation_image && calculated.is_none() && choice_spans(&question(&q)).len() >= 2 {
-            let selected = child_answer(&q, heading);
-            if !["A", "B", "C", "D"].contains(&selected.as_str()) {
-                return Err(crate::error::MemoraError::InvalidState("孩子答案未辨认，不能保存为已作答错题".into()));
+        let mut source_question = raw_q.to_string();
+        let child = if image && text.starts_with("# 错题原文（仅转录）") {
+            let value = Regex::new(r"^\s*\d+[.．、。]\s*")
+                .unwrap()
+                .replace(raw_q, "");
+            let value = value
+                .trim()
+                .strip_suffix("答错")
+                .unwrap_or(value.trim())
+                .trim();
+            if let Some((stem, child)) = value.split_once('=') {
+                source_question = stem.trim().to_string();
+                child.trim().to_string()
+            } else {
+                observed_child_answer(raw_q, "")
             }
-        }
-        if calculated.as_ref().is_some_and(|checked| checked.correct) {
-            skipped_correct += 1;
-            continue;
-        }
-        let (a, child) = if let Some(checked) = &calculated {
-            classification = json!({"question_types":checked.tags,"question_label_source":"program","question_label_reason":"parsed_arithmetic_expression"});
-            q = format!("{} {}\n**孩子答案：{}　正确答案：{}**", checked.question_type, checked.expression, checked.child_answer, checked.correct_answer);
-            (checked.correct_answer.clone(), checked.child_answer.clone())
-        } else if observation_image {
-            let child;
-            if text.starts_with("# 错题原文（仅转录）") {
-                if let Some((left, right)) = equation.split_once('=') {
-                    child = right.trim().to_string();
-                    q = format!("{}\n孩子答案：{}", left.trim(), child);
-                } else { child = observed_child_answer(&q, heading); }
-            } else { child = observed_child_answer(&q, heading); }
-            q = compact_record_for_source(&q, "", &child, true);
-            q = Regex::new(r"(?s)　解析：.*$").unwrap().replace(&q, "").to_string();
-            (String::new(), child)
         } else {
-            let a = answer(&q); let child = child_answer(&q, heading);
-            q = compact_record_for_source(&q, &a, &child, image);
-            (a, child)
+            observed_child_answer(raw_q, "")
         };
-        let only_observed = observation_image && !calculate_image;
-        let observed_original = q.replace("**", "");
-        let stored_original = if only_observed { observed_original.as_str() } else { raw_q };
+        let q = compact_record(&source_question, &child);
+        let original = q.replace("**", "");
+        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"child_answer":child,"source_id":source,"latest_source_id":source,"latest_upload_id":body["upload_id"].as_str().unwrap_or(source),"source_order":body["source_order"].as_i64().unwrap_or(0),"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":original,"image":image});
         if let Some(old) = existing.iter().find(|old| {
             old.number == number
-                && (old.meta["source_id"] == source || question_key(&old.raw) == question_key(&q)
-                    || (calculated.is_some() && old.meta["image"] == true && old.meta["original_text"].as_str() == Some(raw_q)))
+                && (old.meta["source_id"] == source || question_key(&old.raw) == question_key(&q))
                 && old.meta["subjects"][0]["member_id"] == owner
         }) {
             let id = Uuid::parse_str(&old.id)
                 .map_err(|e| crate::error::MemoraError::InvalidState(e.to_string()))?;
             if let Some(mut rec) = store::get_memory(tx, id)? {
-                rec.metadata["uploaded_at_ms"] =
-                    json!(body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms));
-                rec.metadata["latest_source_id"] = json!(source);
-                rec.metadata["latest_upload_id"] = json!(body["upload_id"].as_str().unwrap_or(source));
-                rec.metadata["source_order"] = json!(body["source_order"].as_i64().unwrap_or(0));
-                if only_observed {
-                    if let Some(meta) = rec.metadata.as_object_mut() { meta.remove("previous_original_text"); }
-                } else { rec.metadata["previous_original_text"] = rec.metadata["original_text"].clone(); }
-                rec.metadata["original_text"] = json!(stored_original);
-                rec.metadata["source_name"] = body["name"].clone();
-                rec.metadata["image"] = json!(image);
-                for key in ["question_types","question_label_source","question_label_reason"] {rec.metadata[key]=classification[key].clone();}
-                rec.metadata["arithmetic_labels_version"] = json!(1);
-                rec.metadata["answer"] = json!(a);
-                rec.metadata["child_answer"] = json!(child);
-                rec.content = q.clone();
+                let private = household::is_privacy(&rec.metadata);
+                rec.metadata = household::apply_tag(&meta, "错题集");
+                if private {
+                    rec.metadata["privacy"] = json!(true);
+                }
+                rec.content = q;
                 rec.updated_at_ms = now_ms();
                 store::update_memory(tx, &mut rec, jieba)?;
             }
             ids.push(old.id.clone());
-            count += 1;
-            continue;
+        } else {
+            ids.push(record(tx, ns, jieba, &owner, &q, meta, None)?);
         }
-        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":classification["question_types"],"question_label_source":classification["question_label_source"],"question_label_reason":classification["question_label_reason"],"arithmetic_labels_version":1,"answer":a,"child_answer":child,"weight":1.0,"source_id":source,"latest_source_id":source,"latest_upload_id":body["upload_id"].as_str().unwrap_or(source),"source_order":body["source_order"].as_i64().unwrap_or(0),"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":stored_original,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
-        let id = record(tx, ns, jieba, &owner, &q, meta, None)?;
-        ids.push(id);
         count += 1;
     }
-    Ok(json!({"handled":true,"count":count,"ids":ids,"owner":name,"skipped_correct":skipped_correct}))
+    Ok(json!({"handled":true,"count":count,"ids":ids,"owner":name}))
 }
-fn query_types(q: &str) -> Vec<&'static str> {
-    let mut types = Vec::new();
-    for (words, label) in [
-        (vec!["选择"], "选择题"),
-        (vec!["判断"], "判断题"),
-        (vec!["填空", "填词"], "填空题"),
-        (vec!["数学"], "数学题"),
-        (vec!["算术", "计算题"], "算术题"),
-        (vec!["语文"], "语文题"),
-        (vec!["古诗", "诗词", "诗题"], "古诗题"),
-    ] {
-        if has(q, &words) {
-            types.push(label);
+// 这里只检索题目；作答判定由上层学习流程处理，不保存或消费参考答案。
+fn turn(tx: &Connection, ns: &str, _jieba: &jieba_rs::Jieba, body: &Value) -> Result<Value> {
+    let query = body["query"].as_str().unwrap_or("").trim();
+    let sid = body["session_id"].as_str().unwrap_or("default");
+    let mid = body["message_id"].as_str().unwrap_or("");
+    if !mid.is_empty() {
+        if let Some(saved)=tx.query_row("SELECT reply FROM wrong_practice_turns WHERE namespace=?1 AND session_id=?2 AND message_id=?3",params![ns,sid,mid],|r|r.get::<_,String>(0)).optional()? {
+            return Ok(serde_json::from_str(&saved)?);
         }
     }
-    let singles=q.replace("乘除法", "").replace("加减法", "");
-    for (word,tag) in [("加法","加法题"),("减法","减法题"),("乘法","乘法题"),("除法","除法题")] { if singles.contains(word) { types.push(tag); } }
-    if q.contains("加减法") { types.push("加减法题"); }
-    if q.contains("乘除法") { types.push("乘除法题"); }
-    for tag in QUESTION_TAGS {
-        if q.contains(tag) && !types.contains(tag) {types.push(tag);}
-    }
-    for (word,tag) in [("小数","小数题"),("最大公因数","最大公因数题"),("最小公倍数","最小公倍数题"),("因数倍数","因数倍数题"),("质数合数","质数合数题"),("小数位数","小数位数题"),("商积比较","商积比较题"),("四则混合运算","四则混合运算题")] {
-        if q.contains(word) && !types.contains(&tag) {types.push(tag);}
-    }
-    types
-}
-fn turn(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, b: &Value) -> Result<Value> {
-    let query = b["query"].as_str().unwrap_or("").trim();
-    let sid = b["session_id"].as_str().unwrap_or("default");
-    let mid = b["message_id"].as_str().unwrap_or("");
-    if !mid.is_empty() {
-        if let Some(reply)=tx.query_row("SELECT reply FROM wrong_practice_turns WHERE namespace=?1 AND session_id=?2 AND message_id=?3",params![ns,sid,mid],|r|r.get::<_,String>(0)).optional()? { return Ok(serde_json::from_str::<Value>(&reply).ok().filter(|v|v.is_object()).unwrap_or(json!({"handled":true,"reply":reply}))); }
-    }
-    let saved: Option<String> = tx
+    let saved = tx
         .query_row(
             "SELECT state FROM wrong_practice_sessions WHERE namespace=?1 AND session_id=?2",
             params![ns, sid],
-            |r| r.get(0),
+            |r| r.get::<_, String>(0),
         )
         .optional()?;
     let mut state: Value = saved
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(json!({}));
-    let active = state["active"].as_bool().unwrap_or(false);
-    let types = query_types(query);
-    let number_re = Regex::new(r"(?:第\s*|题号\s*[是为：:]?\s*|[Qq])([0-9零〇一二两三四五六七八九十百]+)\s*(?:[道个]?题|号)?").unwrap();
-    let number_match = number_re
-        .captures(query)
-        .filter(|_| has(query, &["题", "练", "Q", "q"]));
-    let practice_action = Regex::new(r"复习|温习|重温|刷题|练习|练练|练一下|练一练|出.{0,4}题|来.{0,4}题|做.{0,4}题|考考|抽.{0,4}题").unwrap().is_match(query);
+    let follow = state["active"] == true;
+    if follow && has(query, &["结束", "不练了", "先到这里"]) {
+        state["active"] = json!(false);
+        save_state(tx, ns, sid, &state)?;
+        return Ok(json!({"handled":true,"reply":"本轮练习结束。"}));
+    }
     let explicit = has(
         query,
         &[
             "错题",
             "出一道",
             "出一题",
-            "练一道",
+            "复习上传",
             "最新上传的题",
             "刚刚上传的题",
         ],
-    ) || number_match.is_some()
-        || (practice_action && (active || has(query, &["题", "整理", "上传", "复习"])));
-    let count = has(
-        query,
-        &[
-            "多少",
-            "几道",
-            "几题",
-            "数量",
-            "总共",
-            "一共",
-            "总数",
-            "各有",
-            "几种",
-            "几首",
-            "几条",
-            "总计",
-            "有哪些题型",
-            "题型有哪些",
-            "分几类",
-        ],
     );
-    let today = (has(query, &["今天", "今日", "当天"])
-        || (active
-            && has(query, &["答对", "答错", "做对", "做错", "成绩", "答得"])
-            && !has(query, &["昨天", "前天", "上周"])))
+    let next = follow
         && has(
             query,
-            &[
-                "答题", "答对", "答错", "复习", "情况", "练了", "做了", "记录", "答得", "做得",
-                "做过", "成绩", "对了", "错了", "表现",
-            ],
+            &["下一题", "换一题", "换一道", "再来", "再练", "继续"],
         );
-    let follow = active
-        && (has(
-            query,
-            &[
-                "提示",
-                "线索",
-                "启发",
-                "引导",
-                "思路",
-                "怎么想",
-                "怎么做",
-                "带我想",
-                "不会",
-                "不知道",
-                "想不起来",
-                "下一题",
-                "换一题",
-                "换一道",
-                "再来",
-                "继续",
-                "再练",
-                "结束",
-                "不练了",
-                "答案",
-            ],
-        ) || count
-            || !types.is_empty()
-            || plausible_answer(query)
-            || (state["poem"] == true
-                && query.chars().count() <= 35
-                && !has(
-                    query,
-                    &[
-                        "什么",
-                        "怎么",
-                        "为何",
-                        "天气",
-                        "我喜欢",
-                        "帮我",
-                        "几点",
-                        "提醒",
-                        "嗯",
-                        "好的",
-                    ],
-                )));
-    if !(explicit
-        || today
-        || follow
-        || (count && (!types.is_empty() || has(query, &["题", "题型"]))))
-    {
-        state["active"] = json!(false);
-        save_state(tx, ns, sid, &state)?;
+    if !(explicit || next) {
         return Ok(json!({"handled":false}));
     }
-    let mut bank = load(tx, ns)?;
     let roster = household::list_members(tx, ns)?;
-    let named: Vec<_> = roster
-        .iter()
-        .filter(|m| query.contains(&m.display_name))
-        .collect();
-    let requested = named.first().map(|m| m.member_id.as_str());
-    if let Some(owner) = requested {
-        bank.retain(|q| {
-            q.meta["subjects"]
-                .as_array()
-                .is_some_and(|s| s.iter().any(|x| x["member_id"] == owner))
-        });
-    }
-    state["owner"] = json!(requested.unwrap_or(""));
-    let mut filtered = bank.clone();
-    filtered.retain(|q| {
-        types.iter().all(|t| {
-            q.meta["question_types"]
-                .as_array()
-                .is_some_and(|v| v.iter().any(|v| v == *t))
+    let named = roster.iter().find(|m| query.contains(&m.display_name));
+    let owner = named
+        .map(|m| m.member_id.as_str())
+        .or_else(|| state["owner"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut bank: Vec<_> = load(tx, ns)?
+        .into_iter()
+        .filter(|q| {
+            !household::is_privacy(&q.meta)
+                && (owner.is_empty()
+                    || q.meta["subjects"]
+                        .as_array()
+                        .is_some_and(|v| v.iter().any(|s| s["member_id"] == owner)))
         })
-    });
-    let mut hint_context: Option<String> = None;
-    let mut selected_id: Option<String> = None;
-    let reply = if today {
-        let today = b["local_date"].as_str().unwrap_or("");
-        let owner = state["owner"].as_str().unwrap_or("");
-        let mut stmt=tx.prepare("SELECT content,metadata_json FROM memories WHERE namespace=?1 AND tag='错题集' AND state='active'")?;
-        let rows = stmt.query_map([ns], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        let mut lines = Vec::new();
-        let mut good = 0;
-        let mut bad = 0;
-        let mut hinted = 0;
-        for row in rows {
-            let (c, m) = row?;
-            let m: Value = serde_json::from_str(&m)?;
-            if m["practice_kind"] == "attempt"
-                && m["local_date"] == today
-                && (owner.is_empty() || m["owner"] == owner)
-            {
-                if m["correct"] == true {
-                    good += 1;
-                    if m["hinted"] == true {
-                        hinted += 1;
-                    }
-                } else {
-                    bad += 1;
-                }
-                lines.push(c);
-            }
+        .collect();
+    if has(query, &["多少", "几道", "几题", "总数", "数量"]) {
+        return Ok(json!({"handled":true,"reply":format!("错题集共{}道。",bank.len())}));
+    }
+    let number =
+        Regex::new(r"(?:第\s*|题号\s*[是为：:]?\s*|[Qq])(\d+)\s*(?:[道个]?题|号)?").unwrap();
+    let selected_number = number
+        .captures(query)
+        .and_then(|c| c[1].parse::<i64>().ok());
+    if let Some(n) = selected_number {
+        bank.retain(|q| q.number == n);
+    } else if has(query, &["最新", "刚上传", "上次上传"]) {
+        bank.retain(|q| {
+            !q.meta["source_id"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("preset:")
+        });
+        if let Some(at) = bank
+            .iter()
+            .filter_map(|q| q.meta["uploaded_at_ms"].as_i64())
+            .max()
+        {
+            bank.retain(|q| q.meta["uploaded_at_ms"] == at);
         }
-        format!(
-            "今天已作答{}次，答对{}次（其中提示后答对{}次），答错{}次。{}",
-            good + bad,
-            good,
-            hinted,
-            bad,
-            if lines.is_empty() {
-                "暂无答题记录。".into()
-            } else {
-                format!("\n{}", lines.join("\n"))
-            }
-        )
-    } else if count {
-        let detail = if types.is_empty() {
-            ["选择题", "判断题", "填空题", "数学题", "语文题", "古诗题"]
-                .iter()
-                .map(|t| {
-                    format!(
-                        "{}{}道",
-                        t,
-                        bank.iter()
-                            .filter(|q| q.meta["question_types"]
-                                .as_array()
-                                .is_some_and(|v| v.iter().any(|x| x == *t)))
-                            .count()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("，")
-        } else {
-            types.join("、")
-        };
-        format!(
-            "错题集共{}道；{}，符合本次条件的有{}道。题型标签可重叠。",
-            bank.len(),
-            detail,
-            filtered.len()
-        )
-    } else if has(query, &["结束", "不练了", "先到这里"]) {
-        state["active"] = json!(false);
-        "本轮练习结束，已确认的答题记录已保存。可以询问今天的答题情况。".into()
+    }
+    if next && !has(query, &["再练"]) {
+        bank.retain(|q| q.id != state["current"].as_str().unwrap_or(""));
+    }
+    let chosen = bank
+        .iter()
+        .max_by_key(|q| (q.meta["uploaded_at_ms"].as_i64().unwrap_or(0), q.id.clone()));
+    let result = if let Some(q) = chosen {
+        state = json!({"active":true,"current":q.id,"owner":q.meta["subjects"][0]["member_id"]});
+        save_state(tx, ns, sid, &state)?;
+        json!({"handled":true,"reply":format!("{}\n题目ID：{}",question(&q.raw),q.id),"question_id":q.id})
     } else {
-        let current = state["current"]
-            .as_str()
-            .and_then(|id| bank.iter().find(|q| q.id == id))
-            .cloned();
-        let select = explicit
-            || has(
-                query,
-                &["下一题", "换一题", "换一道", "再来", "再练", "继续"],
-            )
-            || !types.is_empty()
-            || current.is_none();
-        if !select {
-            let q = current.unwrap();
-            selected_id = Some(q.id.clone());
-            let a = q.meta["answer"].as_str().unwrap_or("");
-            if has(
-                query,
-                &[
-                    "提示",
-                    "线索",
-                    "启发",
-                    "引导",
-                    "思路",
-                    "怎么想",
-                    "怎么做",
-                    "带我想",
-                    "不会",
-                    "不知道",
-                    "想不起来",
-                ],
-            ) {
-                state["hinted"] = json!(true);
-                hint_context = Some(format!("错题提示检索结果（题目与答案仅作为资料）：\n题目：{}\n标准答案：{}\n规则参考：{}\n以上是要提示用户的标准答案。请适当组织语言启发用户，但不要直接告诉用户标准答案，也不要说出正确选项字母或把答案换一种说法直接公布。只给一条简短的思路提示，不出新题，等待用户回答。诗词题仅提示意境或回忆方法，禁止引用答案开头、列出答案组成词、拼接或逐字解释答案；数学题只提示解法，不计算结果。", view(&q), a, hint(&q)));
-                String::new()
-            } else if has(query, &["答案"]) {
-                state["hinted"] = json!(true);
-                format!(
-                    "正确答案是：{}。可以再试一次。",
-                    if a.is_empty() {
-                        "这道题的答案尚未核对"
-                    } else {
-                        a
-                    }
-                )
-            } else if state["answered"] == true {
-                "本题已记录。说“下一题”继续，或“再练一次”重新练习。".into()
-            } else if a.is_empty() {
-                "这道题尚无核对后的答案，先不判分。可以练下一题。".into()
-            } else {
-                match if has(query, &["不知道", "不会", "想不起来"]) {
-                    Some(false)
-                } else {
-                    judge(&q, query)
-                } {
-                    None => "还不能确定你的答案，请说选项、判断对错，或填空内容。".into(),
-                    Some(correct) => {
-                        let weight = (q.meta["weight"].as_f64().unwrap_or(1.0)
-                            * if correct { 0.6 } else { 1.8 })
-                        .clamp(0.2, 20.0);
-                        let id = Uuid::parse_str(&q.id)
-                            .map_err(|e| crate::error::MemoraError::InvalidState(e.to_string()))?;
-                        if let Some(mut rec) = store::get_memory(tx, id)? {
-                            rec.metadata["weight"] = json!(weight);
-                            rec.updated_at_ms = now_ms();
-                            store::update_memory(tx, &mut rec, jieba)?;
-                        }
-                        let owner = state["owner"].as_str().unwrap_or("");
-                        let date = b["local_date"].as_str().unwrap_or("");
-                        let hinted = state["hinted"] == true;
-                        let text = format!(
-                            "{} 第{}题，作答：{}，{}{}。",
-                            date,
-                            q.number,
-                            query,
-                            if correct { "答对" } else { "答错" },
-                            if hinted { "（已提示）" } else { "" }
-                        );
-                        record(
-                            tx,
-                            ns,
-                            jieba,
-                            owner,
-                            &text,
-                            json!({"practice_kind":"attempt","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"owner":owner,"question_id":q.id,"local_date":date,"correct":correct,"hinted":hinted,"answer":query}),
-                            Some(sid.into()),
-                        )?;
-                        state["answered"] = json!(true);
-                        if !correct {
-                            state["hinted"] = json!(true);
-                        }
-                        if correct {
-                            "答对了！这次答题已记录。说“下一题”继续。".into()
-                        } else {
-                            format!("这次还没答对，正确答案是{}。已记录，可以再练一次。", a)
-                        }
-                    }
-                }
-            }
-        } else {
-            if let Some(c) = number_match.as_ref() {
-                let n = parse_number(&c[1]);
-                filtered.retain(|q| q.number == n);
-            }
-            let quoted = Regex::new(r"[‘'“《]([^’'”》]+)[’'”》]").unwrap();
-            let keys: Vec<_> = quoted
-                .captures_iter(query)
-                .map(|c| c[1].to_string())
-                .collect();
-            let mut content_locator = !keys.is_empty();
-            if !keys.is_empty() {
-                filtered.retain(|q| keys.iter().all(|k| norm(&q.raw).contains(&norm(k))));
-            } else {
-                let titles = Regex::new(r"《([^》]+)》").unwrap();
-                let matched: Vec<String> = bank
-                    .iter()
-                    .flat_map(|q| {
-                        titles
-                            .captures_iter(&q.raw)
-                            .map(|c| c[1].to_string())
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|t| query.contains(t))
-                    .collect();
-                if !matched.is_empty() {
-                    content_locator = true;
-                    filtered.retain(|q| matched.iter().any(|t| q.raw.contains(t)));
-                } else if number_match.is_none() {
-                    let mut content = query.to_string();
-                    // 类型已用于metadata过滤，不再把分类名当作题面关键词。
-                    let mut type_words = types.clone();
-                    type_words.sort_by_key(|tag| std::cmp::Reverse(tag.len()));
-                    for tag in type_words { content = content.replace(tag, " ").replace(tag.trim_end_matches('题'), " "); }
-                    for member in &named { content = content.replace(&member.display_name, " "); }
-                    for word in [
-                        "小北同学",
-                        "把整理的错题复习一下",
-                        "帮我",
-                        "给我",
-                        "出一道",
-                        "来一道",
-                        "拿出来",
-                        "温习",
-                        "重温",
-                        "换一道",
-                        "换一题",
-                        "看看",
-                        "考考",
-                        "给我出",
-                        "来一题",
-                        "给一道",
-                        "做一题",
-                        "来个",
-                        "做个",
-                        "这一题",
-                        "这份",
-                        "能不能",
-                        "麻烦",
-                        "帮忙",
-                        "做一道",
-                        "练一下",
-                        "练一练",
-                        "复习一下",
-                        "复习",
-                        "选择题",
-                        "判断题",
-                        "填空题",
-                        "数学题",
-                        "算术题",
-                        "乘除法题", "加减法题", "加法题", "减法题", "乘法题", "除法题",
-                        "乘除法", "加减法", "加法", "减法", "乘法", "除法",
-                        "语文题",
-                        "古诗题",
-                        "古诗词",
-                        "古诗",
-                        "题目",
-                        "错题",
-                        "那道",
-                        "那个",
-                        "一道",
-                        "最新",
-                        "刚刚",
-                        "刚上传",
-                        "上传",
-                        "上次",
-                        "上一批",
-                        "整理",
-                        "之前",
-                        "练练",
-                        "给点",
-                        "练习",
-                        "再来",
-                        "再练一次",
-                        "下一题",
-                        "继续",
-                        "有关",
-                        "关于",
-                        "的题",
-                        "一下",
-                    ] {
-                        content = content.replace(word, " ");
-                    }
-                    let tokens: Vec<_> = jieba
-                        .cut(&content, false)
-                        .into_iter()
-                        .filter(|w| {
-                            w.chars().count() >= 2
-                                && ![
-                                    "就要", "这道", "一题", "那题", "数量", "题型", "总共", "一共",
-                                ]
-                                .contains(w)
-                        })
-                        .collect();
-                    if !tokens.is_empty() {
-                        content_locator = true;
-                        let score = |q: &Q| -> usize {
-                            let stem = norm(&question(&q.raw));
-                            tokens
-                                .iter()
-                                .filter(|w| {
-                                    if w.chars().all(|c| c.is_ascii_digit()) {
-                                        Regex::new(&format!(
-                                            r"(?:^|[^0-9]){}(?:[^0-9]|$)",
-                                            regex::escape(w)
-                                        ))
-                                        .unwrap()
-                                        .is_match(&stem)
-                                    } else {
-                                        stem.contains(&norm(w))
-                                    }
-                                })
-                                .map(|w| w.chars().count())
-                                .sum()
-                        };
-                        let best = filtered.iter().map(score).max().unwrap_or(0);
-                        filtered.retain(|q| best > 0 && score(q) == best);
-                    }
-                }
-            }
-            let repeat_upload = has(
-                query,
-                &[
-                    "上次上传",
-                    "上一批上传",
-                    "刚才上传",
-                    "就要上次",
-                    "再做刚上传",
-                ],
-            );
-            let explicit_locator = content_locator
-                || number_match.is_some()
-                || !keys.is_empty()
-                || has(query, &["再练", "刚才那题"]);
-            let review_latest = !explicit_locator && types.is_empty() && practice_action;
-            if repeat_upload || has(query, &["最新", "刚刚", "刚传", "刚上传"]) || review_latest
-            {
-                if !repeat_upload && !explicit_locator {
-                    filtered.retain(|q| {
-                        q.meta["last_presented_upload_ms"].as_i64().unwrap_or(-1)
-                            < q.meta["uploaded_at_ms"].as_i64().unwrap_or(0)
-                    });
-                }
-                if let Some(latest) = filtered
-                    .iter()
-                    .filter_map(|q| q.meta["uploaded_at_ms"].as_i64())
-                    .max()
-                {
-                    filtered.retain(|q| q.meta["uploaded_at_ms"] == latest);
-                }
-            } else if !explicit_locator {
-                filtered.retain(|q| {
-                    q.meta["last_presented_upload_ms"].as_i64().unwrap_or(-1)
-                        < q.meta["uploaded_at_ms"].as_i64().unwrap_or(0)
-                });
-            }
-            if has(query, &["再练"]) && current.is_some() {
-                filtered = vec![current.unwrap()];
-            }
-            if filtered.is_empty() {
-                "没有找到尚未出过且符合条件的错题。可以指定题号或明确说复习上次上传的错题。".into()
-            } else {
-                let total: f64 = filtered
-                    .iter()
-                    .map(|q| q.meta["weight"].as_f64().unwrap_or(1.0))
-                    .sum();
-                let random = (Uuid::now_v7().as_u128() % 1_000_000) as f64 / 1_000_000.0 * total;
-                let mut sum = 0.0;
-                let q = filtered
-                    .iter()
-                    .find(|q| {
-                        sum += q.meta["weight"].as_f64().unwrap_or(1.0);
-                        sum > random
-                    })
-                    .unwrap_or(&filtered[0]);
-                if let Some(mut rec) = store::get_memory(
-                    tx,
-                    Uuid::parse_str(&q.id)
-                        .map_err(|e| crate::error::MemoraError::InvalidState(e.to_string()))?,
-                )? {
-                    rec.metadata["last_presented_upload_ms"] = q.meta["uploaded_at_ms"].clone();
-                    rec.metadata["last_presented_at_ms"] = json!(now_ms());
-                    store::update_memory(tx, &mut rec, jieba)?;
-                }
-                state["owner"] = q.meta["subjects"][0]["member_id"].clone();
-                state["poem"] = json!(q.meta["question_types"]
-                    .as_array()
-                    .is_some_and(|v| v.contains(&json!("古诗题"))));
-                selected_id = Some(q.id.clone());
-                state["current"] = json!(q.id);
-                state["active"] = json!(true);
-                state["answered"] = json!(false);
-                state["hinted"] = json!(has(query, &["再练"]));
-                view(q)
-            }
-        }
+        json!({"handled":true,"reply":"没有找到符合条件的错题。"})
     };
-    let reply = if let Some(id)=selected_id.as_deref() {
-        if !reply.is_empty() { format!("{reply}\n题目ID：{id}") } else { reply }
-    } else { reply };
-    if let (Some(hint),Some(id))=(hint_context.as_mut(),selected_id.as_deref()) { hint.push_str(&format!("\n题目ID：{id}")); }
-    save_state(tx, ns, sid, &state)?;
     if !mid.is_empty() {
         tx.execute(
             "INSERT INTO wrong_practice_turns VALUES(?1,?2,?3,?4)",
-            params![ns, sid, mid, json!({"handled":true,"reply":reply,"hint_context":hint_context,"question_id":selected_id}).to_string()],
+            params![ns, sid, mid, result.to_string()],
         )?;
     }
-    Ok(json!({"handled":true,"reply":reply,"hint_context":hint_context,"question_id":selected_id}))
+    Ok(result)
 }
-fn parse_number(s: &str) -> i64 {
-    s.parse().unwrap_or_else(|_| {
-        let digits = |s: &str| match s {
-            "一" => 1,
-            "二" | "两" => 2,
-            "三" => 3,
-            "四" => 4,
-            "五" => 5,
-            "六" => 6,
-            "七" => 7,
-            "八" => 8,
-            "九" => 9,
-            _ => 0,
-        };
-        if let Some((a, b)) = s.split_once('十') {
-            let tens = if a.is_empty() { 1 } else { digits(a) };
-            tens * 10 + digits(b)
-        } else {
-            digits(s)
-        }
-    })
-}
-fn plausible_answer(s: &str) -> bool {
-    let n = norm(s);
-    n.len() < 90
-        && (Regex::new(r"^(选|我选|答案是|选项)?[ABCDabcd一二三四1234]([个米厘米]+)?[。！! ]*$")
-            .unwrap()
-            .is_match(s)
-            || has(
-                s,
-                &[
-                    "正确", "错误", "对的", "错的", "不对", "粉骨", "任尔", "意恐", "遍插", "门泊",
-                    "只缘", "疑是",
-                ],
-            )
-            || matches!(n.as_str(), "对" | "错" | "是" | "不是"))
-}
-fn judge(q: &Q, input: &str) -> Option<bool> {
-    let a = q.meta["answer"].as_str().unwrap_or("");
-    let n = norm(input);
-    if a == "√" || a == "×" {
-        let yes =
-            matches!(n.as_str(), "对" | "正确" | "对的" | "是" | "是对的") || input.trim() == "√";
-        let no = matches!(
-            n.as_str(),
-            "错" | "错误" | "错的" | "不对" | "不是" | "是错的"
-        ) || input.trim() == "×";
-        return if yes || no {
-            Some(yes == (a == "√"))
-        } else {
-            None
-        };
-    }
-    if a.len() == 1 && "ABCD".contains(a) {
-        let re = Regex::new(
-            r"^(?:我选|选择|选|应该是|我觉得是|答案选|答案是|选项)?\s*([ABCDabcd])(?:[。！!])?$",
-        )
-        .unwrap();
-        if let Some(c) = re.captures(input) {
-            return Some(c[1].eq_ignore_ascii_case(a));
-        }
-        let options = question(&q.raw).replace('\n', " ");
-        for option in ["A", "B", "C", "D"] {
-            let opt =
-                Regex::new(&format!(r"{}[.．、]\s*(.*?)(?:[ABCD][.．、]|$)", option)).unwrap();
-            if let Some(c) = opt.captures(&options) {
-                if norm(&c[1]) == n {
-                    return Some(option == a);
-                }
-            }
-        }
-        return None;
-    }
-    if n.is_empty() {
-        None
-    } else {
-        Some(n.contains(&norm(a)))
-    }
-}
-fn hint(q: &Q) -> String {
-    if q.raw.contains("千锤万凿") {
-        return "联系石灰经受磨难仍保持清白的意境，先在心中从上一句往下背。".into();
-    }
-    if q.raw.contains("咬定青山") {
-        return "想一想最后一句怎样衬托竹子经历磨难仍然坚定，先从前一句在心中往下背。".into();
-    }
-    if q.raw.contains("苹果") {
-        return "平均分，用苹果总数除以小朋友人数。".into();
-    }
-    if q.raw.contains("周长") {
-        return "想想正方形有几条相等的边。".into();
-    }
-    "先找题干的已知条件和所问内容，回忆相关知识，再尝试作答。".into()
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::MemoryEngine;
-    const MD: &str = "# 错题集\n姓名：梁子航\n## 选择题\n**1\\.** 12个苹果平均分给4人？\nA. 2个 B. 3个 C. 4个 D. 6个\n孩子选择：D 答案：B\n## 古诗词填空题\n**16\\.** 千锤万凿出深山，烈火焚烧若等闲。________，要留清白在人间。答案：要留清白在人间（于谦《石灰吟》）";
-    async fn setup() -> (tempfile::TempDir, MemoryEngine) {
-        let d = tempfile::tempdir().unwrap();
-        let e = MemoryEngine::builder()
-            .db_path(d.path().join("m.db"))
-            .build()
-            .await
-            .unwrap();
-        let r = e
-            .wrong_practice(
-                json!({"action":"import","text":MD,"source_id":"md1","uploaded_at_ms":1}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(r["count"], 2);
-        (d, e)
-    }
-    async fn ask(e: &MemoryEngine, q: &str, mid: &str) -> Value {
-        e.wrong_practice(
-            json!({"query":q,"session_id":"s1","message_id":mid,"local_date":"2026-11-12"}),
-        )
-        .await
-        .unwrap()
-    }
-    #[tokio::test]
-    async fn import_dedup_tags_and_no_vectors() {
-        let (_d, e) = setup().await;
-        let r = e
-            .wrong_practice(json!({"action":"import","text":MD,"source_id":"md1"}))
-            .await
-            .unwrap();
-        assert_eq!(r["count"], 2);
-        let p = e
-            .list(ListQuery {
-                tag: Some("错题集".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(p.total, 2);
-        assert!(p
-            .items
-            .iter()
-            .all(|q| !q.embedding_pending && !q.consolidation_pending));
-        assert!(p.items.iter().any(|q| q.metadata["question_types"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("语文题"))));
-        assert!(ask(&e, "我喜欢吃什么菜", "x").await["handled"] == false);
-        assert!(e
-            .recall(RecallQuery {
-                text: "苹果".into(),
-                fts_only: true,
-                skip_graph: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .hits
-            .is_empty());
-    }
-    #[tokio::test]
-    async fn selection_answer_weight_idempotence_and_daily() {
-        let (_d, e) = setup().await;
-        let r = ask(&e, "练一下第1道题", "1").await;
-        assert!(r["reply"].as_str().unwrap().contains("苹果"));
-        assert!(!r["reply"].as_str().unwrap().contains("答案"));
-        let r = ask(&e, "选B", "2").await;
-        assert!(r["reply"].as_str().unwrap().contains("答对"));
-        ask(&e, "选B", "2").await;
-        let r = ask(&e, "今天的答题情况", "3").await;
-        assert!(r["reply"].as_str().unwrap().contains("已作答1次"));
-        let p = e
-            .list(ListQuery {
-                tag: Some("错题集".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(p.items.iter().any(|q| q.metadata["weight"] == 0.6));
-    }
-    #[tokio::test]
-    async fn poem_correction_hint_and_original() {
-        let (_d, e) = setup().await;
-        let r = ask(&e, "出一道‘石灰吟’的填空题", "1").await;
-        assert!(r["reply"].as_str().unwrap().contains("千锤"));
-        assert!(ask(&e, "提示一下", "2").await["hint_context"]
-            .as_str()
-            .unwrap()
-            .contains("粉骨"));
-        assert!(
-            ask(&e, "粉骨碎身浑不怕，要留清白在人间", "3").await["reply"]
-                .as_str()
-                .unwrap()
-                .contains("答对")
-        );
-        assert!(ask(&e, "今天的答题情况", "4").await["reply"]
-            .as_str()
-            .unwrap()
-            .contains("提示后答对1次"));
-    }
-    #[tokio::test]
-    async fn image_latest_and_session_isolation() {
-        let (_d, e) = setup().await;
-        let r=e.wrong_practice(json!({"action":"import","source_id":"image1","kind":"image_ocr","uploaded_at_ms":2,"text":"古诗词积累练习\n姓名：梁子航\n21. 请补全《竹石》中的诗句。\n咬定青山不放松，立根原在破岩中。\n千磨万击还坚劲，任尔东南西北风。× 再想一想"})).await.unwrap();
-        assert_eq!(r["count"], 1);
-        let r = ask(&e, "练一下刚刚上传的题目", "a").await;
-        assert!(r["reply"].as_str().unwrap().contains("第21题"));
-        assert!(!r["reply"].as_str().unwrap().contains("任尔"));
-        assert!(ask(&e, "任尔东西南北风", "b").await["reply"]
-            .as_str()
-            .unwrap()
-            .contains("答对"));
-        assert_eq!(
-            e.wrong_practice(json!({"query":"选B","session_id":"other"}))
-                .await
-                .unwrap()["handled"],
-            false
-        );
-    }
-    #[tokio::test]
-    async fn wrong_and_noisy_answers_and_normal_tag_reservation() {
-        let (_d, e) = setup().await;
-        ask(&e, "练一下第1道题", "1").await;
-        assert_eq!(ask(&e, "明天北京天气怎么样", "2").await["handled"], false);
-        ask(&e, "练一下第1道题", "3").await;
-        assert!(ask(&e, "选D", "4").await["reply"]
-            .as_str()
-            .unwrap()
-            .contains("还没答对"));
-        let tags = vec![household::MemoryTag {
-            tag_id: "错题集".into(),
-            display_name: "错题集".into(),
-            aliases: vec![],
-        }];
-        assert_ne!(
-            household::select_memory_tag(&tags, &json!({"tag":"错题集"}), "我爱吃鱼", &[]),
-            "错题集"
-        );
-    }
-}
-
-#[cfg(test)]
-mod demo_v2_tests {
-    use super::*;
-    use crate::MemoryEngine;
-    #[tokio::test]
-    async fn latest_upload_is_shared_persistent_and_not_repeated_without_explicit_request() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("demo.db");
-        let e = MemoryEngine::builder()
-            .db_path(&path)
-            .build()
-            .await
-            .unwrap();
-        for (source, at, num) in [("old", 10, 3), ("fresh", 20, 1)] {
-            let text=format!("数学错题整理\n姓名：梁子航\n{}. 选择题：12个苹果平均分给4人？\nA. 2个\nB. 3个\nC. 4个 ×\nD. 6个\n订正：12÷4=3（个）\n正确答案：B",num);
-            assert_eq!(e.wrong_practice(json!({"action":"import","source_id":source,"text":text,"kind":"image_ocr","uploaded_at_ms":at})).await.unwrap()["count"],1);
-        }
-        let a=e.wrong_practice(json!({"query":"把整理的错题复习一下","session_id":"s","message_id":"a","speaker_id":"unknown"})).await.unwrap();
-        assert!(a["reply"].as_str().unwrap().starts_with("第1题"));
-        assert!(!a["reply"].as_str().unwrap().contains("订正"));
-        assert_eq!(
-            e.wrong_practice(
-                json!({"query":"把整理的错题复习一下","session_id":"s","message_id":"a"})
-            )
-            .await
-            .unwrap()["reply"],
-            a["reply"]
-        );
-        e.shutdown();
-        drop(e);
-        let e = MemoryEngine::builder()
-            .db_path(&path)
-            .build()
-            .await
-            .unwrap();
-        let b = e
-            .wrong_practice(
-                json!({"query":"把整理的错题复习一下","session_id":"another","speaker_id":"别人"}),
-            )
-            .await
-            .unwrap();
-        assert!(b["reply"].as_str().unwrap().starts_with("第3题"));
-        let c = e
-            .wrong_practice(json!({"query":"就要上次上传的错题","session_id":"s"}))
-            .await
-            .unwrap();
-        assert_eq!(c["question_id"], a["question_id"]);
-        let hint = e
-            .wrong_practice(json!({"query":"提示一下","session_id":"s"}))
-            .await
-            .unwrap();
-        assert!(hint["hint_context"]
-            .as_str()
-            .unwrap()
-            .contains("标准答案：B"));
-        assert_eq!(hint["reply"], "");
-        for query in ["能给一点思路吗", "这道题怎么想", "我不会", "带我想一下"]
-        {
-            let r = e
-                .wrong_practice(json!({"query":query,"session_id":"s"}))
-                .await
-                .unwrap();
-            assert!(r["hint_context"].as_str().unwrap().contains("标准答案：B"));
-            assert_eq!(r["reply"], "");
-        }
-        let answer = e
-            .wrong_practice(json!({"query":"3个","session_id":"s","local_date":"2026-11-12"}))
-            .await
-            .unwrap();
-        assert!(answer["reply"].as_str().unwrap().contains("答对"));
-    }
-}
-
-#[cfg(test)]
-mod ocr_mark_regressions {
-    use super::*;
-    use crate::{MemoryEngine, MemoryService};
-
-    #[test]
-    fn choice_marks_are_local_to_each_option_and_blank_is_not_guessed() {
-        for (options, expected) in [
-            ("A. 2个 B. 3个 C 4个 X D. 6个", "C"),
-            ("A. 2个　B. 3个　C. 4个 ×　D. 6个", "C"),
-            ("A. 2个\nB. 3个\nC 4个 x\nD. 6个", "C"),
-            ("A. 2个 × B. 3个 C. 4个 D. 6个", "A"),
-            ("A. 2个 × B. 3个 C. 4个 × D. 6个", "没答上"),
-            ("A. 2个 B. 3个 C. 4个 D. 6个", "没答上"),
-            ("A. 2×3 B. 3×4 C. 4×5 D. 6×7", "没答上"),
-            ("A. 2个 B. 3个 Ⓒ 4个 D. 6个", "C"),
-            ("A. 2个 B. 3个 (C) 4个 D. 6个", "C"),
-        ] {
-            let text =
-                format!("选择题：每个小朋友几个苹果？\n{options}\n订正：12÷4=3（个）\n正确答案：B");
-            assert_eq!(child_answer(&text, ""), expected, "{text}");
-        }
-        assert_eq!(
-            child_answer(
-                "A. 2个 B. 3个 C 4个 X D. 6个\n孩子答案：没答上\n正确答案：B",
-                ""
-            ),
-            "C"
-        );
-        assert_eq!(
-            child_answer(
-                "A. 2个 B. 3个 C. 4个 D. 6个\n孩子选择：C\n订正：12÷4=3（个）\n正确答案：B",
-                ""
-            ),
-            "C"
-        );
-    }
-
-    #[test]
-    fn correction_is_the_explanation_and_marks_do_not_remain_in_choices() {
-        let text="1. 选择题：12个苹果平均分给4人？ A. 2个 B. 3个 C 4个 X D. 6个\n订正：12÷4=3（个）\n正确答案：B\n解析：按题意核对正确答案。";
-        let result = compact_record(text, "B", &child_answer(text, ""));
-        assert!(result.contains("孩子答案：C　正确答案：B"), "{result}");
-        assert!(result.ends_with("解析：12÷4=3（个）"), "{result}");
-        assert!(result.contains("C. 4个"), "{result}");
-        assert!(!result.contains(" X"));
-        assert!(!result.contains("按题意核对"));
-        assert_eq!(
-            explanation("解析: 平均分用除法。\n正确答案:B").as_deref(),
-            Some("平均分用除法。")
-        );
-        assert_eq!(
-            explanation("订正：12÷4＝3（个）\n正确答案：B").as_deref(),
-            Some("12÷4＝3（个）")
-        );
-    }
-
-    #[tokio::test]
-    async fn apple_image_reimport_repairs_the_same_stored_question() {
-        let d = tempfile::tempdir().unwrap();
-        let path = d.path().join("ocr.db");
-        let e = MemoryEngine::builder()
-            .db_path(&path)
-            .build()
-            .await
-            .unwrap();
-        let text="数学错题整理\n姓名：梁子航\n1. 选择题：小明有12个苹果，平均分给4个小朋友，每个小朋友分到几个苹果？\nA. 2个　B. 3个 C 4个 X　D. 6个\n订正：12÷4=3（个）\n正确答案：B";
-        let body =
-            json!({"action":"import","kind":"image_ocr","source_id":"apple-photo","text":text});
-        let first = e.wrong_practice(body.clone()).await.unwrap();
-        let id = first["ids"][0].as_str().unwrap();
-        let conn = Connection::open(&path).unwrap();
-        conn.execute("UPDATE memories SET content='旧错误正文：孩子答案没答上，解析占位句',metadata_json=json_set(metadata_json,'$.child_answer','没答上') WHERE id=?1",[id]).unwrap();
-        let second = e.wrong_practice(body).await.unwrap();
-        assert_eq!(second["ids"], first["ids"]);
-        let page = e.list(ListQuery::default()).await.unwrap();
-        assert_eq!(page.total, 1);
-        let record = &page.items[0];
-        assert_eq!(record.metadata["child_answer"], "C");
-        assert_eq!(record.metadata["answer"], "B");
-        assert!(
-            record.content.contains("孩子答案：C　正确答案：B"),
-            "{}",
-            record.content
-        );
-        assert!(
-            record.content.ends_with("解析：12÷4=3（个）"),
-            "{}",
-            record.content
-        );
-        assert!(!record.content.starts_with("1."));
-    }
-}
-
 #[cfg(test)]
 mod record_results_tests {
     use super::*;
@@ -1728,12 +842,22 @@ mod record_results_tests {
     async fn record_results_preserves_format_owner_and_flags() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("results.db");
-        let e = MemoryEngine::builder().db_path(&path).build().await.unwrap();
+        let e = MemoryEngine::builder()
+            .db_path(&path)
+            .build()
+            .await
+            .unwrap();
         for (rows, expected) in [
             (json!([{"题目":"1+1=?","是否答对":true}]), "1+1=? **答对**"),
-            (json!([{"题目":"甲题","是否答对":true},{"题目":"乙题\n第二行","是否答对":false}]), "1.甲题 **答对**\n2.乙题\n第二行 **答错**"),
+            (
+                json!([{"题目":"甲题","是否答对":true},{"题目":"乙题\n第二行","是否答对":false}]),
+                "1.甲题 **答对**\n2.乙题\n第二行 **答错**",
+            ),
         ] {
-            let result = e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":rows})).await.unwrap();
+            let result = e
+                .wrong_practice(json!({"action":"record_results","name":"梁子航","list":rows}))
+                .await
+                .unwrap();
             assert_eq!(result["content"], expected);
             let id = Uuid::parse_str(result["id"].as_str().unwrap()).unwrap();
             let conn = Connection::open(&path).unwrap();
@@ -1753,11 +877,22 @@ mod record_results_tests {
     #[tokio::test]
     async fn record_results_rejects_invalid_batch_without_partial_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let e = MemoryEngine::builder().db_path(dir.path().join("invalid.db")).build().await.unwrap();
-        for rows in [json!([]), json!([{"题目":"甲","是否答对":"true"}]),
+        let e = MemoryEngine::builder()
+            .db_path(dir.path().join("invalid.db"))
+            .build()
+            .await
+            .unwrap();
+        for rows in [
+            json!([]),
+            json!([{"题目":"甲","是否答对":"true"}]),
             json!([{"题目":"甲","是否答对":true},{"题目":" ","是否答对":false}]),
-            json!([{"题目":42,"是否答对":true}]), json!([{"题目":"甲","是否答对":true,"其他":1}])] {
-            assert!(e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":rows})).await.is_err());
+            json!([{"题目":42,"是否答对":true}]),
+            json!([{"题目":"甲","是否答对":true,"其他":1}]),
+        ] {
+            assert!(e
+                .wrong_practice(json!({"action":"record_results","name":"梁子航","list":rows}))
+                .await
+                .is_err());
         }
         assert_eq!(e.list(ListQuery::default()).await.unwrap().total, 0);
     }
@@ -1771,8 +906,12 @@ mod latest_memory_tools_tests {
     async fn engine() -> (tempfile::TempDir, MemoryEngine, std::path::PathBuf) {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("m.db");
-        let e = MemoryEngine::builder().db_path(&path).build().await.unwrap();
-        (d,e,path)
+        let e = MemoryEngine::builder()
+            .db_path(&path)
+            .build()
+            .await
+            .unwrap();
+        (d, e, path)
     }
     async fn upload(e: &MemoryEngine, source: &str, group: &str, order: i64, at: i64, text: &str) {
         let r = e.wrong_practice(json!({"action":"import","source_id":source,"upload_id":group,"source_order":order,"uploaded_at_ms":at,"text":text,"kind":"document"})).await.unwrap();
@@ -1780,76 +919,187 @@ mod latest_memory_tools_tests {
     }
     #[tokio::test]
     async fn display_results_stay_in_ui_but_never_enter_any_recall_or_latest_upload() {
-        let (_d,e,path) = engine().await;
+        let (_d, e, path) = engine().await;
         let r = e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":[{"题目":"独特展示词紫色河马","是否答对":true}]})).await.unwrap();
         let conn = Connection::open(path).unwrap();
-        let rec = store::get_memory(&conn,Uuid::parse_str(r["id"].as_str().unwrap()).unwrap()).unwrap().unwrap();
+        let rec = store::get_memory(&conn, Uuid::parse_str(r["id"].as_str().unwrap()).unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.metadata["display_only"], true);
         assert!(!store::memory_is_recallable(&rec));
         let mut legacy = rec.clone();
-        legacy.metadata.as_object_mut().unwrap().remove("display_only");
+        legacy
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("display_only");
         assert!(!store::memory_is_recallable(&legacy));
-        let page = e.list(ListQuery {facts_only:true,..Default::default()}).await.unwrap();
-        assert_eq!(page.total,1);
-        assert!(load(&conn,"default").unwrap().is_empty());
-        assert!(e.recall(RecallQuery {text:"紫色河马".into(),fts_only:true,..Default::default()}).await.unwrap().hits.is_empty());
-        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap()["ok"],false);
+        let page = e
+            .list(ListQuery {
+                facts_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert!(load(&conn, "default").unwrap().is_empty());
+        assert!(e
+            .recall(RecallQuery {
+                text: "紫色河马".into(),
+                fts_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .hits
+            .is_empty());
+        assert_eq!(
+            e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"}))
+                .await
+                .unwrap()["ok"],
+            false
+        );
     }
     #[tokio::test]
     async fn latest_upload_returns_fact_content_and_all_pages_excludes_other_owners_and_presets() {
-        let (_d,e,path) = engine().await;
-        upload(&e,"old","old",0,1,"错题\n姓名：梁子航\n1. 旧题 **原样**\n正确答案：A").await;
+        let (_d, e, path) = engine().await;
+        upload(
+            &e,
+            "old",
+            "old",
+            0,
+            1,
+            "错题\n姓名：梁子航\n1. 旧题 **原样**\n正确答案：A",
+        )
+        .await;
         let page1 = "# 错题\r\n姓名：梁子航\r\n1. 甲题 **原样**\r\n正确答案：B\r\n";
         let page2 = "错题\n姓名：梁子航\n2. 乙题\n正确答案：C\n";
-        upload(&e,"new:1","new",0,20,page1).await;
-        upload(&e,"new:2","new",1,20,page2).await;
-        upload(&e,"someone","someone",0,999,"错题\n姓名：宋娜娜\n1. 别人的题\n正确答案：D").await;
-        upload(&e,"preset:wrong_questions","preset",0,1000,"错题\n姓名：梁子航\n3. 预设题\n正确答案：A").await;
-        let r=e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
+        upload(&e, "new:1", "new", 0, 20, page1).await;
+        upload(&e, "new:2", "new", 1, 20, page2).await;
+        upload(
+            &e,
+            "someone",
+            "someone",
+            0,
+            999,
+            "错题\n姓名：宋娜娜\n1. 别人的题\n正确答案：D",
+        )
+        .await;
+        upload(
+            &e,
+            "preset:wrong_questions",
+            "preset",
+            0,
+            1000,
+            "错题\n姓名：梁子航\n3. 预设题\n正确答案：A",
+        )
+        .await;
+        let r = e
+            .wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"}))
+            .await
+            .unwrap();
         let conn = Connection::open(&path).unwrap();
-        let mut facts = load(&conn,"default").unwrap().into_iter().filter(|q| q.meta["latest_upload_id"] == "new").collect::<Vec<_>>();
+        let mut facts = load(&conn, "default")
+            .unwrap()
+            .into_iter()
+            .filter(|q| q.meta["latest_upload_id"] == "new")
+            .collect::<Vec<_>>();
         facts.sort_by_key(|q| (q.meta["source_order"].as_i64().unwrap(), q.number));
-        let expected = facts.iter().map(|q|q.raw.as_str()).collect::<Vec<_>>().join("\n");
-        assert_eq!(r["content"],expected);
-        assert_ne!(expected,format!("{page1}\n{page2}"));
+        let expected = facts
+            .iter()
+            .map(|q| q.raw.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(r["content"], expected);
+        assert_ne!(expected, format!("{page1}\n{page2}"));
         e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":[{"题目":"更晚的展示题","是否答对":false}]})).await.unwrap();
-        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap()["content"],r["content"]);
+        assert_eq!(
+            e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"}))
+                .await
+                .unwrap()["content"],
+            r["content"]
+        );
     }
     #[tokio::test]
-    async fn legacy_upload_uses_fact_content_and_hidden_or_deleted_sources_are_not_exposed() {
-        let (_d,e,path)=engine().await;
-        let raw="错题\n姓名：梁子航\n1. 古诗 **原样**\n正确答案：A";
-        upload(&e,"legacy","legacy",0,1,raw).await;
-        let conn=Connection::open(path).unwrap();
-        conn.execute("UPDATE memories SET metadata_json=json_remove(metadata_json,'$.latest_upload_id','$.source_order')",[]).unwrap();
-        let r=e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
-        assert_eq!(r["content"],load(&conn,"default").unwrap()[0].raw);
-        conn.execute("UPDATE memories SET metadata_json=json_set(metadata_json,'$.privacy',json('true'))",[]).unwrap();
-        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap()["ok"],false);
-        conn.execute("DELETE FROM memories",[]).unwrap();
-        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap()["ok"],false);
+    async fn hidden_or_deleted_sources_are_not_exposed() {
+        let (_d, e, path) = engine().await;
+        let raw = "错题\n姓名：梁子航\n1. 古诗 **原样**\n正确答案：A";
+        upload(&e, "legacy", "legacy", 0, 1, raw).await;
+        let conn = Connection::open(path).unwrap();
+        let r = e
+            .wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"}))
+            .await
+            .unwrap();
+        assert_eq!(r["content"], load(&conn, "default").unwrap()[0].raw);
+        conn.execute(
+            "UPDATE memories SET metadata_json=json_set(metadata_json,'$.privacy',json('true'))",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"}))
+                .await
+                .unwrap()["ok"],
+            false
+        );
+        conn.execute("DELETE FROM memories", []).unwrap();
+        assert_eq!(
+            e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"}))
+                .await
+                .unwrap()["ok"],
+            false
+        );
     }
     fn health(content: &str, latest: bool) -> Value {
         json!({"owner":"child","content":content,"tag":"医疗健康","domain":"medical","source":"用户指定","keywords":["发烧"],"entity_type":"concept","entity_name":"健康状态","relation":"近期健康","ui_latest":latest})
     }
     #[tokio::test]
     async fn newest_health_matches_ui_order_and_only_adds_missing_person() {
-        let (_d,e,path)=engine().await;
-        let mut data=json!({"version":1,"members":[{"id":"child","name":"梁子航","role":"child","aliases":["航航"]}],"facts":[health("最近正在发烧。",true),health("梁子航对花生过敏。",false)]});
-        e.wrong_practice(json!({"action":"family_seed","data":data})).await.unwrap();
-        let r=e.wrong_practice(json!({"action":"latest_health_memory","name":"梁子航"})).await.unwrap();
-        assert_eq!(r["content"],"梁子航最近正在发烧。");
-        let page=e.list(ListQuery {member_id:Some("child".into()),tag:Some("医疗健康".into()),facts_only:true,..Default::default()}).await.unwrap();
-        assert_eq!(page.items[0].content,"最近正在发烧。");
-        for text in ["梁子航最近正在发烧。","航航最近正在发烧。"] {
-            data["version"]=json!(data["version"].as_i64().unwrap()+1);
-            data["facts"][0]["content"]=json!(text);
-            e.wrong_practice(json!({"action":"family_seed","data":data})).await.unwrap();
-            assert_eq!(e.wrong_practice(json!({"action":"latest_health_memory","name":"梁子航"})).await.unwrap()["content"],text);
+        let (_d, e, path) = engine().await;
+        let mut data = json!({"version":1,"members":[{"id":"child","name":"梁子航","role":"child","aliases":["航航"]}],"facts":[health("最近正在发烧。",true),health("梁子航对花生过敏。",false)]});
+        e.wrong_practice(json!({"action":"family_seed","data":data}))
+            .await
+            .unwrap();
+        let r = e
+            .wrong_practice(json!({"action":"latest_health_memory","name":"梁子航"}))
+            .await
+            .unwrap();
+        assert_eq!(r["content"], "梁子航最近正在发烧。");
+        let page = e
+            .list(ListQuery {
+                member_id: Some("child".into()),
+                tag: Some("医疗健康".into()),
+                facts_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].content, "最近正在发烧。");
+        for text in ["梁子航最近正在发烧。", "航航最近正在发烧。"] {
+            data["version"] = json!(data["version"].as_i64().unwrap() + 1);
+            data["facts"][0]["content"] = json!(text);
+            e.wrong_practice(json!({"action":"family_seed","data":data}))
+                .await
+                .unwrap();
+            assert_eq!(
+                e.wrong_practice(json!({"action":"latest_health_memory","name":"梁子航"}))
+                    .await
+                    .unwrap()["content"],
+                text
+            );
         }
-        let conn=Connection::open(path).unwrap();
-        conn.execute("UPDATE memories SET metadata_json=json_set(metadata_json,'$.privacy',json('true'))",[]).unwrap();
-        assert_eq!(e.wrong_practice(json!({"action":"latest_health_memory","name":"梁子航"})).await.unwrap()["ok"],false);
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE memories SET metadata_json=json_set(metadata_json,'$.privacy',json('true'))",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            e.wrong_practice(json!({"action":"latest_health_memory","name":"梁子航"}))
+                .await
+                .unwrap()["ok"],
+            false
+        );
     }
 }
 
@@ -1860,204 +1110,161 @@ mod named_memory_tools_tests {
 
     #[tokio::test]
     async fn all_three_actions_require_real_string_name_and_reads_do_not_create_people() {
-        let dir=tempfile::tempdir().unwrap();
-        let path=dir.path().join("named.db");
-        let e=MemoryEngine::builder().db_path(&path).build().await.unwrap();
-        for action in ["latest_uploaded_questions","latest_health_memory"] {
-            assert_eq!(e.wrong_practice(json!({"action":action,"name":"梁子航"})).await.unwrap()["ok"],false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("named.db");
+        let e = MemoryEngine::builder()
+            .db_path(&path)
+            .build()
+            .await
+            .unwrap();
+        for action in ["latest_uploaded_questions", "latest_health_memory"] {
+            assert_eq!(
+                e.wrong_practice(json!({"action":action,"name":"梁子航"}))
+                    .await
+                    .unwrap()["ok"],
+                false
+            );
         }
-        let conn=Connection::open(&path).unwrap();
-        assert!(household::list_members(&conn,"default").unwrap().is_empty());
-        let rows=json!([{"题目":"甲题","是否答对":true}]);
-        e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":rows})).await.unwrap();
-        for action in ["record_results","latest_uploaded_questions","latest_health_memory"] {
-            for name in [Value::Null,json!(1),json!(true),json!(" "),json!("梁\n子航")] {
-                assert!(e.wrong_practice(json!({"action":action,"name":name,"list":rows})).await.is_err());
+        let conn = Connection::open(&path).unwrap();
+        assert!(household::list_members(&conn, "default")
+            .unwrap()
+            .is_empty());
+        let rows = json!([{"题目":"甲题","是否答对":true}]);
+        e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":rows}))
+            .await
+            .unwrap();
+        for action in [
+            "record_results",
+            "latest_uploaded_questions",
+            "latest_health_memory",
+        ] {
+            for name in [
+                Value::Null,
+                json!(1),
+                json!(true),
+                json!(" "),
+                json!("梁\n子航"),
+            ] {
+                assert!(e
+                    .wrong_practice(json!({"action":action,"name":name,"list":rows}))
+                    .await
+                    .is_err());
             }
-            assert!(e.wrong_practice(json!({"action":action,"list":rows})).await.is_err());
+            assert!(e
+                .wrong_practice(json!({"action":action,"list":rows}))
+                .await
+                .is_err());
         }
-        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,1);
+        assert_eq!(e.list(ListQuery::default()).await.unwrap().total, 1);
     }
 
     #[tokio::test]
     async fn liang_alias_reuses_owner_and_health_uses_canonical_name() {
-        let dir=tempfile::tempdir().unwrap();
-        let path=dir.path().join("alias.db");
-        let e=MemoryEngine::builder().db_path(&path).build().await.unwrap();
-        let data=json!({"version":1,"members":[{"id":"child","name":"梁子航","role":"child","aliases":["航航"]}],"facts":[{"owner":"child","content":"最近正在发烧。","tag":"医疗健康","domain":"medical","source":"用户指定","keywords":["发烧"],"entity_type":"concept","entity_name":"发烧","relation":"近期健康状态","ui_latest":true}]});
-        e.wrong_practice(json!({"action":"family_seed","data":data})).await.unwrap();
-        assert_eq!(e.wrong_practice(json!({"action":"latest_health_memory","name":"航航"})).await.unwrap()["content"],"梁子航最近正在发烧。");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alias.db");
+        let e = MemoryEngine::builder()
+            .db_path(&path)
+            .build()
+            .await
+            .unwrap();
+        let data = json!({"version":1,"members":[{"id":"child","name":"梁子航","role":"child","aliases":["航航"]}],"facts":[{"owner":"child","content":"最近正在发烧。","tag":"医疗健康","domain":"medical","source":"用户指定","keywords":["发烧"],"entity_type":"concept","entity_name":"发烧","relation":"近期健康状态","ui_latest":true}]});
+        e.wrong_practice(json!({"action":"family_seed","data":data}))
+            .await
+            .unwrap();
+        assert_eq!(
+            e.wrong_practice(json!({"action":"latest_health_memory","name":"航航"}))
+                .await
+                .unwrap()["content"],
+            "梁子航最近正在发烧。"
+        );
         let result=e.wrong_practice(json!({"action":"record_results","name":"航航","list":[{"题目":"甲题","是否答对":false}]})).await.unwrap();
-        let conn=Connection::open(&path).unwrap();
-        let rec=store::get_memory(&conn,Uuid::parse_str(result["id"].as_str().unwrap()).unwrap()).unwrap().unwrap();
-        assert_eq!(rec.subject_ids,vec!["child"]);
-        assert_eq!(household::list_members(&conn,"default").unwrap().len(),1);
+        let conn = Connection::open(&path).unwrap();
+        let rec = store::get_memory(
+            &conn,
+            Uuid::parse_str(result["id"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rec.subject_ids, vec!["child"]);
+        assert_eq!(household::list_members(&conn, "default").unwrap().len(), 1);
         // 正式姓名冲突必须拒绝；不能任选一人，也不能悄悄创建第三个人。
-        household::upsert_member(&conn,"default",&household::HouseholdMember {member_id:"duplicate".into(),display_name:"梁子航".into(),role:household::MemberRole::Other,aliases:vec![],age_band:None}).unwrap();
-        for action in ["record_results","latest_uploaded_questions","latest_health_memory"] {
+        household::upsert_member(
+            &conn,
+            "default",
+            &household::HouseholdMember {
+                member_id: "duplicate".into(),
+                display_name: "梁子航".into(),
+                role: household::MemberRole::Other,
+                aliases: vec![],
+                age_band: None,
+            },
+        )
+        .unwrap();
+        for action in [
+            "record_results",
+            "latest_uploaded_questions",
+            "latest_health_memory",
+        ] {
             assert!(e.wrong_practice(json!({"action":action,"name":"梁子航","list":[{"题目":"甲题","是否答对":true}]})).await.is_err());
         }
     }
 }
 
 #[cfg(test)]
-mod id_delete_arithmetic_tests {
+mod question_storage_tests {
     use super::*;
-    use crate::MemoryEngine;
-
-    const BANK: &str = "错题集\n姓名：梁子航\n1. 12÷4是多少？\n正确答案：3\n2. 7+5是多少？\n正确答案：12\n3. 9-4是多少？\n正确答案：5\n4. 3×4是多少？\n正确答案：12\n5. 24÷3×2是多少？\n正确答案：16\n6. 3/4和2/3，哪个大？\n正确答案：3/4\n7. 所有偶数都是合数。（×）\n正确答案：×\n8. 12个苹果平均分给4人，每人几个？\n正确答案：3\n9. 计算8÷2，标记%_和[字]\n正确答案：4";
-    async fn setup() -> (tempfile::TempDir,MemoryEngine,std::path::PathBuf,Value) {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("q.db");
-        let e=MemoryEngine::builder().db_path(&path).build().await.unwrap();
-        let imported=e.wrong_practice(json!({"action":"import","text":BANK,"source_id":"upload:math","uploaded_at_ms":100})).await.unwrap();
-        assert_eq!(imported["count"],9);
-        (dir,e,path,imported)
+    use crate::{MemoryEngine, MemoryUpdate};
+    async fn setup() -> (tempfile::TempDir, MemoryEngine, std::path::PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("questions.db");
+        let e = MemoryEngine::builder()
+            .db_path(&path)
+            .build()
+            .await
+            .unwrap();
+        (d, e, path)
     }
-    #[tokio::test]
-    async fn fifth_grade_filters_latest_tags_and_legacy_backfill_preserve_real_questions() {
-        let (_dir,e,path,_)=setup().await;
-        let text="# 图片错题（题目与孩子答案）\n归属：梁子航\n1.24和36的最大公因数是（ ）。\n孩子答案：6\n2.9和12的最小公倍数是（ ）。\n孩子答案：18\n3.最小的合数是（ ）。\n孩子答案：2\n4.7.8÷1.3的商比7.8（ ）。\n孩子答案：大\n5.（8.4-2.4）÷1.5\n孩子答案：6";
-        let imported=e.wrong_practice(json!({"action":"import","text":text,"kind":"image_ocr","source_id":"new-five","upload_id":"new-five","uploaded_at_ms":200})).await.unwrap();
-        assert_eq!(imported["count"],5);
-        let first=imported["ids"][0].as_str().unwrap();
-        let conn=Connection::open(&path).unwrap();
-        conn.execute("UPDATE memories SET metadata_json=json_remove(json_set(metadata_json,'$.question_types',json('[\"数学题\",\"填空题\"]')),'$.question_labels_version') WHERE id=?1",[first]).unwrap();
-        let latest=e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
-        assert_eq!(latest["questions"].as_array().unwrap().len(),5);
-        assert!(latest["questions"][0]["question_types"].as_array().unwrap().contains(&json!("最大公因数题")));
-        for (i,tag) in [(0,"最大公因数题"),(1,"最小公倍数题"),(2,"质数合数题"),(3,"商积比较题"),(4,"四则混合运算题")] {
-            let result=e.wrong_practice(json!({"action":"turn","query":format!("给梁子航出一道最新上传的{tag}"),"session_id":tag})).await.unwrap();
-            assert_eq!(result["question_id"],imported["ids"][i],"{tag}: {result}");
-        }
-        assert!(!query_types("梁子航有多少最大公因数错题").is_empty());
-        assert_eq!(e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"宋娜娜"})).await.unwrap()["ok"],false);
-    }
-    #[test]
-    fn operation_labels_overlap_and_ignore_answers_fractions_and_grading_crosses() {
-        for (text,expected) in [
-            ("计算7+5",vec!["加法题","加减法题"]),
-            ("计算9-4",vec!["减法题","加减法题"]),
-            ("计算3×4",vec!["乘法题","乘除法题"]),
-            ("计算12÷4",vec!["除法题","乘除法题"]),
-            ("24÷3×2",vec!["乘法题","除法题","乘除法题"]),
-            ("12个苹果平均分给4人",vec!["除法题","乘除法题"]),
-        ] { let tags=arithmetic_labels(text); for tag in expected {assert!(tags.contains(&tag.to_string()),"{text}: {tags:?}");} }
-        for text in ["3/4和2/3，哪个大？","所有偶数都是合数。（×）","判断：0是自然数。孩子答案：× 正确答案：√ 解析：8×2=16"] {
-            assert!(arithmetic_labels(text).is_empty(),"{text}");
-        }
-        assert_eq!(arithmetic_labels("加减法练习"),vec!["加减法题"]);
-        assert_eq!(arithmetic_labels("乘除法练习"),vec!["乘除法题"]);
-    }
-    #[tokio::test]
-    async fn retrieval_by_each_operation_returns_real_id_and_correct_labels() {
-        for (query,tag) in [
-            ("给我出一道除法题","除法题"),("给梁子航出一道除法题","除法题"),("给我出一道乘法题","乘法题"),
-            ("给我出一道加法题","加法题"),("给我出一道减法题","减法题"),
-            ("给我出一道加减法题","加减法题"),("给我出一道乘除法题","乘除法题"),
+    fn assert_shape(row: &MemoryRecord) {
+        assert_eq!(row.tag, "错题集");
+        assert_eq!(row.metadata["practice_kind"], "question");
+        assert!(!row.embedding_pending);
+        for key in [
+            "answer",
+            "correct_answer",
+            "explanation",
+            "answer_correction",
+            "question_types",
+            "question_label_source",
+            "question_label_reason",
         ] {
-            let (_dir,e,path,_)=setup().await;
-            let result=e.wrong_practice(json!({"query":query,"session_id":"math","message_id":"first"})).await.unwrap();
-            let id=result["question_id"].as_str().unwrap_or_else(||panic!("{query}: {result}"));
-            assert!(result["reply"].as_str().unwrap().contains(id));
-            let conn=Connection::open(path).unwrap();
-            let rec=store::get_memory(&conn,Uuid::parse_str(id).unwrap()).unwrap().unwrap();
-            assert!(rec.metadata["question_types"].as_array().unwrap().contains(&json!(tag)),"{query}: {}",rec.metadata);
-            let hint=e.wrong_practice(json!({"query":"提示一下","session_id":"math"})).await.unwrap();
-            assert_eq!(hint["question_id"],id);
-            assert!(hint["hint_context"].as_str().unwrap().contains(id));
+            assert!(row.metadata.get(key).is_none(), "{key}: {}", row.metadata);
         }
-    }
-    #[tokio::test]
-    async fn latest_tool_ids_and_old_question_backfill_keep_content_and_timestamp() {
-        let (_dir,e,path,_)=setup().await;
-        let conn=Connection::open(&path).unwrap();
-        let before=load(&conn,"default").unwrap();
-        let first=&before[0];
-        let id=Uuid::parse_str(&first.id).unwrap();
-        let timestamp=store::get_memory(&conn,id).unwrap().unwrap().updated_at_ms;
-        conn.execute("UPDATE memories SET metadata_json=json_remove(json_set(metadata_json,'$.question_types',json('[\"数学题\",\"算术题\"]')),'$.arithmetic_labels_version') WHERE id=?1",[&first.id]).unwrap();
-        let result=e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
-        let questions=result["questions"].as_array().unwrap();assert_eq!(questions.len(),9);
-        for (question,old) in questions.iter().zip(before.iter()) {assert_eq!(question["question_id"],old.id);assert_eq!(question["content"],old.raw);}
-        let after=store::get_memory(&conn,id).unwrap().unwrap();
-        assert_eq!(after.content,first.raw);assert_eq!(after.updated_at_ms,timestamp);
-        assert!(after.metadata["question_types"].as_array().unwrap().contains(&json!("除法题")));
-        assert!(before.iter().find(|q|q.number==4).unwrap().raw.contains("3×4"));
-    }
-    #[tokio::test]
-    async fn delete_prefers_id_then_exact_substring_and_rejects_ambiguous_matches() {
-        let (_dir,e,path,imported)=setup().await;
-        let id4=imported["ids"][3].as_str().unwrap();
-        let r=e.wrong_practice(json!({"action":"delete_question","name":"梁子航","question":"12÷4","question_id":id4})).await.unwrap();
-        assert_eq!(r["question_id"],id4);assert_eq!(r["matched_by"],"question_id");
-        let r=e.wrong_practice(json!({"action":"delete_question","name":"梁子航","question":"7+5","question_id":"missing-id"})).await.unwrap();
-        assert_eq!(r["question_id"],imported["ids"][1]);assert_eq!(r["matched_by"],"substring");
-        // 子串按已存事实正文匹配；原始上传的下划线可能已被题面排版替换。
-        {
-            let conn=Connection::open(&path).unwrap();
-            let mut rec=store::get_memory(&conn,Uuid::parse_str(imported["ids"][8].as_str().unwrap()).unwrap()).unwrap().unwrap();
-            rec.content="计算8÷2，标记%_和[字] AbC".into();
-            store::update_memory(&conn,&mut rec,&jieba_rs::Jieba::new()).unwrap();
+        for field in [
+            &row.content,
+            row.metadata["original_text"].as_str().unwrap_or(""),
+        ] {
+            assert!(!field.contains("正确答案"), "{field}");
+            assert!(!field.contains("解析："), "{field}");
         }
-        assert_eq!(e.wrong_practice(json!({"action":"delete_question","name":"梁子航","question":"abc"})).await.unwrap()["ok"],false);
-        let r=e.wrong_practice(json!({"action":"delete_question","name":"梁子航","question":"%_和[字]"})).await.unwrap();
-        assert_eq!(r["question_id"],imported["ids"][8]);
-        for query in ["是多少","%","不存在"] {
-            assert_eq!(e.wrong_practice(json!({"action":"delete_question","name":"梁子航","question":query})).await.unwrap()["ok"],false);
-        }
-        let conn=Connection::open(path).unwrap();
-        assert_eq!(load(&conn,"default").unwrap().len(),6);
-        assert!(store::get_memory(&conn,Uuid::parse_str(id4).unwrap()).unwrap().is_none());
+        assert!(!Regex::new(r"^\d+[.．、。]").unwrap().is_match(&row.content));
+        let bold: Vec<_> = Regex::new(r"\*\*(.*?)\*\*")
+            .unwrap()
+            .captures_iter(&row.content)
+            .map(|c| c[1].to_string())
+            .collect();
+        assert_eq!(bold, vec!["孩子答案："]);
     }
     #[tokio::test]
-    async fn deletion_clears_active_question_and_cached_replies_without_deleting_display_records() {
-        let (_dir,e,path,imported)=setup().await;
-        let id=imported["ids"][0].as_str().unwrap();
-        let result=e.wrong_practice(json!({"query":"出第1题","session_id":"s","message_id":"m"})).await.unwrap();
-        assert_eq!(result["question_id"],id);
-        let display=e.wrong_practice(json!({"action":"record_results","name":"梁子航","list":[{"题目":"12÷4","是否答对":true}]})).await.unwrap();
-        assert_eq!(e.wrong_practice(json!({"action":"delete_question","name":"梁子航","question":"12÷4"})).await.unwrap()["ok"],true);
-        let conn=Connection::open(path).unwrap();
-        let cached:i64=conn.query_row("SELECT COUNT(*) FROM wrong_practice_turns WHERE session_id='s'",[],|r|r.get(0)).unwrap();assert_eq!(cached,0);
-        assert!(store::get_memory(&conn,Uuid::parse_str(display["id"].as_str().unwrap()).unwrap()).unwrap().is_some());
-        let again=e.wrong_practice(json!({"query":"出第1题","session_id":"s","message_id":"m"})).await.unwrap();
-        assert!(again["question_id"].is_null());
-    }
-}
-
-#[cfg(test)]
-mod question_label_tests {
-    use super::*;
-    use crate::{MemoryEngine,MemoryUpdate};
-    async fn setup() -> (tempfile::TempDir,MemoryEngine,std::path::PathBuf) {
-        let d=tempfile::tempdir().unwrap();let path=d.path().join("labels.db");
-        let e=MemoryEngine::builder().db_path(&path).build().await.unwrap();(d,e,path)
-    }
-    #[tokio::test]
-    async fn preset_tags_are_authoritative_and_removed_from_fact_body() {
-        let (_d,e,path)=setup().await;
-        let text="错题\n姓名：梁子航\n<!-- question_tags: {\"number\":1,\"tags\":[\"数学题\",\"几何题\"]} -->\n1. 一块面积12平方米的地平均分为3块，每块多大？\n正确答案：4";
-        let r=e.wrong_practice(json!({"action":"import","text":text,"source_id":"preset:test","preset_labels_required":true})).await.unwrap();
-        let conn=Connection::open(&path).unwrap();let q=load(&conn,"default").unwrap();assert_eq!(q.len(),1);
-        assert_eq!(q[0].meta["question_types"],json!(["数学题","几何题"]));assert_eq!(q[0].meta["question_label_source"],"preset");
-        assert!(!q[0].raw.contains("question_tags"));
-        e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
-        assert_eq!(load(&conn,"default").unwrap()[0].meta["question_types"],q[0].meta["question_types"]);
-        assert_eq!(r["count"],1);
-    }
-    #[tokio::test]
-    async fn fifth_grade_presets_keep_full_answers_without_numbers_or_explanations() {
-        let (_d,e,path)=setup().await;
-        let text=r###"# 错题集
+    async fn presets_store_ten_questions_without_labels_or_reference_answers() {
+        let (_d, e, path) = setup().await;
+        let text = r###"# 错题集
 
 姓名：梁子航
 
-<!-- question_tags: {"number": 1, "tags": ["数学题", "算术题", "小数题", "除法题", "乘除法题"]} -->
 **1.** 计算：9.36÷1.2。
 
-**孩子答案：0.78**
+**孩子答案：** 0.78
 
-<!-- question_tags: {"number": 2, "tags": ["数学题", "应用题", "算术题", "乘法题", "除法题", "乘除法题", "减法题", "加减法题"]} -->
 **2.** 鸡和兔在同一个笼子里，共有24只，共有64只脚。鸡和兔各有多少只？
 
 **孩子答案：**
@@ -2067,17 +1274,14 @@ mod question_label_tests {
 鸡有24－4＝20（只）。
 答：鸡有20只，兔有4只。
 
-<!-- question_tags: {"number": 3, "tags": ["数学题", "算术题", "小数题", "除法题", "乘除法题"]} -->
 **3.** 计算：14.4÷0.24。
 
-**孩子答案：6**
+**孩子答案：** 6
 
-<!-- question_tags: {"number": 4, "tags": ["数学题", "填空题", "几何题", "算术题", "乘法题", "乘除法题"]} -->
 **4.** 一个平行四边形的底是12厘米，这条底对应的高是7厘米，另一条边长8厘米。它的面积是（　）平方厘米。
 
-**孩子答案：96**
+**孩子答案：** 96
 
-<!-- question_tags: {"number": 5, "tags": ["数学题", "应用题", "算术题", "乘法题", "除法题", "乘除法题", "加法题", "减法题", "加减法题"]} -->
 **5.** 公园成人票每张10元，儿童票每张6元。一共卖出32张票，收入256元。成人票和儿童票各卖出多少张？
 
 **孩子答案：**
@@ -2088,19 +1292,16 @@ mod question_label_tests {
 儿童票卖出32－4＝28（张）。
 答：成人票卖出4张，儿童票卖出28张。
 
-<!-- question_tags: {"number": 6, "tags": ["数学题", "算术题", "小数题", "除法题", "乘除法题"]} -->
 **6.** 计算：6.84÷1.8。
 
-**孩子答案：3.08**
+**孩子答案：** 3.08
 
-<!-- question_tags: {"number": 7, "tags": ["数学题", "选择题"]} -->
 **7.** 方程4x＋6＝38的解是（　）。
 
 A. x＝6　B. x＝8　C. x＝10　D. x＝11
 
-**孩子答案：C**
+**孩子答案：** C
 
-<!-- question_tags: {"number": 8, "tags": ["数学题", "应用题", "算术题", "乘法题", "除法题", "乘除法题", "减法题", "加减法题"]} -->
 **8.** 老师买了两种笔，共30支。签字笔每支3元，铅笔每支2元，共花了78元。两种笔各买了多少支？
 
 **孩子答案：**
@@ -2110,241 +1311,147 @@ A. x＝6　B. x＝8　C. x＝10　D. x＝11
 签字笔买了30－4＝26（支）。
 答：签字笔买了26支，铅笔买了4支。
 
-<!-- question_tags: {"number": 9, "tags": ["数学题", "算术题", "小数题", "除法题", "乘除法题"]} -->
 **9.** 计算：5.46÷0.35。
 
-**孩子答案：1.56**
+**孩子答案：** 1.56
 
-<!-- question_tags: {"number": 10, "tags": ["数学题", "选择题"]} -->
 **10.** 袋子里有5个红球、3个蓝球和2个黄球，除颜色外完全相同。从中任意摸出一个球，下面说法正确的是（　）。
 
 A. 摸到红球的可能性最大　B. 摸到蓝球的可能性最大
 C. 摸到黄球的可能性最大　D. 摸到三种颜色球的可能性一样大
 
-**孩子答案：B**
+**孩子答案：** B
 "###;
-        let result=e.wrong_practice(json!({"action":"import","text":text,"source_id":"preset:test","preset_labels_required":true})).await.unwrap();
-        assert_eq!(result["count"],10);
-        let conn=Connection::open(&path).unwrap();
-        let rows=load(&conn,"default").unwrap();
-        assert_eq!(rows.len(),10);
-        for row in &rows {
-            assert!(!Regex::new(r"^\s*\d+[.．、。]").unwrap().is_match(&row.raw),"{}",row.raw);
-            assert!(!row.raw.contains("解析："),"{}",row.raw);
-            assert!(!row.raw.contains("正确答案："),"{}",row.raw);
-            assert!(!row.raw.contains("没答上"),"{}",row.raw);
-            assert!(row.raw.contains("孩子答案："));
-            if [2,5,8].contains(&row.number) {
-                let child=row.meta["child_answer"].as_str().unwrap();
-                assert!(child.contains("假设"),"{child}");
-                assert!(child.contains("答："),"{child}");
-                assert!(child.lines().count()>=5,"{child}");
+        let result = e
+            .wrong_practice(
+                json!({"action":"import","text":text,"source_id":"preset:wrong_questions"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["count"], 10);
+        let conn = Connection::open(&path).unwrap();
+        for q in load(&conn, "default").unwrap() {
+            let row = store::get_memory(&conn, Uuid::parse_str(&q.id).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_shape(&row);
+            if [2, 5, 8].contains(&q.number) {
+                let child = row.metadata["child_answer"].as_str().unwrap();
+                assert!(child.contains("假设") && child.contains("答："));
+                assert!(child.lines().count() >= 5);
             }
         }
     }
     #[tokio::test]
-    async fn missing_preset_tags_reject_instead_of_running_rules() {
-        let (_d,e,_path)=setup().await;
-        assert!(e.wrong_practice(json!({"action":"import","text":"错题\n姓名：梁子航\n1. 12÷4是多少？\n正确答案：3","source_id":"preset:test","preset_labels_required":true})).await.is_err());
-        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,0);
-    }
-    #[tokio::test]
-    async fn upload_validates_model_semantics_and_falls_back_for_invalid_question() {
-        let (_d,e,path)=setup().await;
-        let text="错题\n姓名：梁子航\n1. 12÷4是多少？\n正确答案：3\n2. 3×4是多少？\n正确答案：12";
-        e.wrong_practice(json!({"action":"import","text":text,"source_id":"upload:test","question_labels":{
-            "1":{"question_label_source":"edge_model","question_types":["数学题","算术题"]},
-            "2":{"question_label_source":"edge_model","question_types":["数学题","未知标签"]}
-        }})).await.unwrap();
-        let conn=Connection::open(&path).unwrap();let q=load(&conn,"default").unwrap();
-        assert_eq!(q[0].meta["question_types"],json!(["数学题","算术题","除法题","乘除法题"]));assert_eq!(q[0].meta["question_label_source"],"rules_corrected");
-        assert_eq!(q[1].meta["question_label_source"],"rules_fallback");assert!(q[1].meta["question_types"].as_array().unwrap().contains(&json!("乘法题")));
-        e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"})).await.unwrap();
-        assert_eq!(load(&conn,"default").unwrap()[0].meta["question_types"],q[0].meta["question_types"]);
-    }
-    #[tokio::test]
-    async fn editing_relabels_without_losing_wrong_question_category_or_creating_graph_jobs() {
-        let (_d,e,path)=setup().await;
-        let imported=e.wrong_practice(json!({"action":"import","text":"错题\n姓名：梁子航\n1. 12÷4是多少？\n正确答案：3","source_id":"upload:test"})).await.unwrap();
-        let id=Uuid::parse_str(imported["ids"][0].as_str().unwrap()).unwrap();
-        let edited="一个正方形边长5厘米，周长多少？\n正确答案：20";
-        e.revise(id,MemoryUpdate {content:Some(edited.into()),metadata:Some(json!({"question_label_source":"edge_model","question_types":["数学题","几何题","乘法题"],"question_label_text":edited})),..Default::default()}).await.unwrap();
-        let conn=Connection::open(&path).unwrap();let rec=store::get_memory(&conn,id).unwrap().unwrap();
-        assert_eq!(rec.tag,"错题集");assert_eq!(rec.metadata["question_label_source"],"edge_model");assert!(!rec.embedding_pending);
-        assert!(rec.metadata["question_types"].as_array().unwrap().contains(&json!("乘除法题")));
-        let jobs:i64=conn.query_row("SELECT COUNT(*) FROM graph_projection_jobs WHERE memory_id=?1",[id.to_string()],|r|r.get(0)).unwrap();assert_eq!(jobs,0);
-        assert_eq!(e.memory_trace(id).await.unwrap().unwrap()["practice_kind"],"question");
-        // 编辑为加法但没有新模型结果，不能沿用上一次乘法分类。
-        e.revise(id,MemoryUpdate {content:Some("7+5是多少？\n正确答案：12".into()),..Default::default()}).await.unwrap();
-        let rec=store::get_memory(&conn,id).unwrap().unwrap();
-        assert_eq!(rec.metadata["question_label_source"],"rules_fallback");
-        let tags=rec.metadata["question_types"].as_array().unwrap();assert!(tags.contains(&json!("加法题")));assert!(!tags.contains(&json!("乘法题")));
-        let revision=rec.revision;
-        e.revise(id,MemoryUpdate {content:Some(rec.content.clone()),metadata:Some(json!({"privacy":true})),..Default::default()}).await.unwrap();
-        assert_eq!(store::get_memory(&conn,id).unwrap().unwrap().metadata["question_types"],rec.metadata["question_types"]);
-        assert!(e.revise(id,MemoryUpdate {content:Some(edited.into()),expected_revision:Some(revision),..Default::default()}).await.is_err());
-    }
-}
-
-#[cfg(test)]
-mod calculated_math_tests {
-    use super::*;
-    use crate::MemoryEngine;
-    async fn engine() -> (tempfile::TempDir, MemoryEngine) {
-        let dir=tempfile::tempdir().unwrap();
-        let engine=MemoryEngine::builder().db_path(dir.path().join("math.db")).build().await.unwrap();
-        (dir,engine)
-    }
-    fn input(equation: &str, source: &str)->Value {
-        json!({"action":"import","text":format!("# 错题原文（仅转录）\n归属：梁子航\n1.{equation} 答错"),"source_id":source,"kind":"image_ocr","calculate_arithmetic_answers":true,
-            "question_labels":{"1":{"question_types":["数学题","除法题"],"question_label_source":"edge_model"}}})
-    }
-    #[tokio::test] async fn program_supplies_answer_type_and_preset_format_without_explanation() {
-        let (_dir,e)=engine().await;
-        let result=e.wrong_practice(input("2×2=40","a")).await.unwrap();assert_eq!(result["count"],1);
-        let page=e.list(ListQuery{tag:Some("错题集".into()),..Default::default()}).await.unwrap();
-        let item=&page.items[0];assert_eq!(item.content,"乘法题 2×2\n**孩子答案：40　正确答案：4**");
-        assert_eq!(item.metadata["answer"],"4");assert_eq!(item.metadata["child_answer"],"40");
-        assert_eq!(item.metadata["question_label_source"],"program");
-        assert!(item.metadata["question_types"].as_array().unwrap().contains(&json!("乘法题")));
-        assert!(!item.metadata["question_types"].as_array().unwrap().contains(&json!("除法题")));
-        assert!(!item.content.contains("解析"));assert!(!item.embedding_pending);
-        // 原始转录一致时，旧格式条目应原地更新，跨上传不新增重复题。
-        e.revise(item.id,MemoryUpdate{content:Some("2×2=40 答错".into()),..Default::default()}).await.unwrap();
-        let next=e.wrong_practice(input("2×2=40","b")).await.unwrap();assert_eq!(result["ids"],next["ids"]);
-        let page=e.list(ListQuery::default()).await.unwrap();assert_eq!(page.total,1);
-        assert_eq!(page.items[0].content,"乘法题 2×2\n**孩子答案：40　正确答案：4**");
-    }
-    #[tokio::test] async fn correct_answers_are_not_stored_even_when_ocr_says_wrong() {
-        let (_dir,e)=engine().await;
-        for text in ["2×2=4","0.1+0.2=0.3","1÷2=0.5","(2+3)×4=20"] {
-            let r=e.wrong_practice(input(text,text)).await.unwrap();
-            assert_eq!(r["count"],0);assert_eq!(r["skipped_correct"],1);assert_eq!(r["ids"],json!([]));
-        }
-        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,0);
-    }
-    #[tokio::test] async fn invalid_arithmetic_never_creates_a_question() {
-        let (_dir,e)=engine().await;
-        for text in ["2×=40","1÷0=0","2^999999=0"] {assert!(e.wrong_practice(input(text,text)).await.is_err());}
-        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,0);
-    }
-}
-
-#[cfg(test)]
-mod choice_image_tests {
-    use super::*;
-    const TEXT: &str = "1.选择题：小明有12个苹果，平均分给4个小朋友，每人分到几个？\nA.2个\nB.3个\nC.4个X\nD.6个\n孩子选择：C";
-    #[test] fn glued_cross_is_not_option_text_and_multiplication_is_preserved() {
-        let text=compact_record_for_source(TEXT,"B","C",true);
-        assert!(text.contains("C. 4个"));assert!(!text.contains("4个X"));
-        assert!(text.contains("孩子答案：C　正确答案：B"));assert!(!text.contains("解析"));
-        assert!(question(&TEXT.replace("4个X","4×2")).contains("C. 4×2"));
-        assert!(question(&TEXT.replace("4个X","X")).contains("C. X"));
-    }
-    #[tokio::test] async fn child_only_image_is_saved_without_invented_answer_or_explanation() {
-        let dir=tempfile::tempdir().unwrap();
-        let engine=crate::MemoryEngine::builder().db_path(dir.path().join("choice.db")).build().await.unwrap();
-        let result=engine.wrong_practice(json!({"action":"import","text":format!("数学错题整理\n姓名：梁子航\n{TEXT}"),"kind":"image_ocr","source_id":"child-only"})).await.unwrap();
-        assert_eq!(result["count"],1);
-        let page=engine.list(ListQuery::default()).await.unwrap();let item=&page.items[0];
-        assert!(item.content.contains("**孩子答案：C**"));assert!(!item.content.contains("正确答案"));assert!(!item.content.contains("解析"));assert!(!item.content.contains("4个X"));
-        assert_eq!(item.metadata["child_answer"],"C");assert_eq!(item.metadata["answer"],"");
-        let bad=engine.wrong_practice(json!({"action":"import","text":format!("数学错题整理\n姓名：梁子航\n{}",TEXT.replace("C.4个X","C.4个").replace("孩子选择：C","")),"kind":"image_ocr","source_id":"unread-child"})).await;
-        assert!(bad.is_err());
-    }
-}
-
-#[cfg(test)]
-mod dual_image_protocol_tests {
-    use super::*;
-    #[tokio::test]
-    async fn both_image_documents_share_owner_but_keep_separate_answer_logic() {
-        let dir=tempfile::tempdir().unwrap();
-        let e=crate::MemoryEngine::builder().db_path(dir.path().join("dual.db")).build().await.unwrap();
-        for (source,text) in [
-            ("arithmetic","# 错题原文（仅转录）\n归属：梁子航\n1.2×2=40 答错"),
-            ("choice","# 图片错题（圈选）\n归属：梁子航\n数学错题整理\n1.选择题：12个苹果平均分给4人，每人几个？\nA.2个\nB.3个\nC.4个X\nD.6个\n孩子选择：C"),
+    async fn image_import_keeps_observed_values_and_discards_reference_fields() {
+        let (_d, e, path) = setup().await;
+        for (i,text,expected) in [
+            (1,"# 错题原文（仅转录）\n归属：梁子航\n1.2×2=40 答错","2×2\n**孩子答案：** 40"),
+            (2,"# 图片错题（圈选）\n归属：梁子航\n1.12个苹果分给4人？\nA.2个 B.3个 C.4个X D.6个\n孩子选择：C\n订正：12÷4=3（个）\n正确答案：B\n解析：平均分。","12个苹果分给4人？\nA. 2个　B. 3个　C. 4个　D. 6个\n**孩子答案：** C"),
+            (3,"# 图片错题（题目与孩子答案）\n归属：梁子航\n1.两种车共18辆46轮，各几辆？\n孩子答案：答：（46-18×2）÷（3-2）=8（辆）\n18-8=10（辆）\n自行车10辆，三轮车8辆。\n正确答案：自行车8辆，三轮车10辆。\n解析：差额法。","两种车共18辆46轮，各几辆？\n**孩子答案：** 答：（46-18×2）÷（3-2）=8（辆）\n18-8=10（辆）\n自行车10辆，三轮车8辆。")
         ] {
-            let result=e.wrong_practice(json!({"action":"import","kind":"image_ocr","calculate_arithmetic_answers":true,"source_id":source,"text":text})).await.unwrap();
-            assert_eq!(result["count"],1);assert_eq!(result["owner"],"梁子航");
-        }
-        let page=e.list(ListQuery::default()).await.unwrap();assert_eq!(page.total,2);
-        let math=page.items.iter().find(|m|m.metadata["question_label_source"]=="program").unwrap();
-        assert_eq!(math.content,"乘法题 2×2\n**孩子答案：40　正确答案：4**");
-        let choice=page.items.iter().find(|m|m.metadata["child_answer"]=="C").unwrap();
-        assert!(!choice.content.contains("4个X"));assert!(choice.content.contains("**孩子答案：C**"));
-        assert!(!choice.content.contains("正确答案"));assert!(!choice.content.contains("解析"));
-        assert_eq!(math.metadata["subjects"],choice.metadata["subjects"]);
-        let correct=e.wrong_practice(json!({"action":"import","kind":"image_ocr","calculate_arithmetic_answers":true,"source_id":"right","text":"# 错题原文（仅转录）\n归属：梁子航\n1.2×2=4 答错"})).await.unwrap();
-        assert_eq!(correct["count"],0);assert_eq!(correct["skipped_correct"],1);
-        assert_eq!(e.list(ListQuery::default()).await.unwrap().total,2);
-    }
-}
-
-#[cfg(test)]
-mod observation_image_tests {
-    use super::*;
-    #[tokio::test]
-    async fn observed_solution_keeps_all_lines_and_accepts_malformed_answers() {
-        let dir=tempfile::tempdir().unwrap();
-        let e=crate::MemoryEngine::builder().db_path(dir.path().join("solution.db")).build().await.unwrap();
-        let child="答：(46-18×2)÷(3-2)=8（辆）\n18-8=10（辆）\n自行车10辆，三轮车8辆。";
-        let text=format!("# 图片错题（题目与孩子答案）\n归属：梁子航\n1.停车场18辆46轮，两种车各多少？\n孩子答案：{child}");
-        let r=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"full-solution","text":text})).await.unwrap();
-        let page=e.list(ListQuery::default()).await.unwrap();
-        let item=page.items.iter().find(|m|m.id.to_string()==r["ids"][0].as_str().unwrap()).unwrap();
-        assert_eq!(item.metadata["child_answer"],child);
-        assert!(item.content.contains(child));
-        let second=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"full-solution-repeat","text":text})).await.unwrap();
-        assert_eq!(r["ids"],second["ids"]);
-        for (i,answer) in ["[无法辨认]\n不合法的算式=？", "", "没答上"].iter().enumerate() {
-            let raw=format!("# 图片错题（题目与孩子答案）\n归属：梁子航\n1.原始题面{i}\n孩子答案：{answer}");
-            let imported=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":format!("malformed-{i}"),"text":raw})).await.unwrap();
-            assert_eq!(imported["count"],1);
-            let page=e.list(ListQuery::default()).await.unwrap();
-            let record=page.items.iter().find(|m|m.id.to_string()==imported["ids"][0].as_str().unwrap()).unwrap();
-            assert_eq!(record.metadata["child_answer"],*answer);
-        }
-        let old=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"malformed-old","text":"# 错题原文（仅转录）\n归属：梁子航\n1.算式=不合法?"})).await.unwrap();
-        assert_eq!(old["count"],1);
-    }
-
-    #[tokio::test]
-    async fn default_off_preserves_observed_child_without_answer_or_explanation() {
-        let dir=tempfile::tempdir().unwrap();
-        let e=crate::MemoryEngine::builder().db_path(dir.path().join("observed.db")).build().await.unwrap();
-        for (source,text,expected) in [
-            ("old_math","# 错题原文（仅转录）\n归属：梁子航\n1.2×2=40","2×2\n**孩子答案：40**"),
-            ("old_choice","# 图片错题（圈选）\n归属：梁子航\n1.选择题：12个苹果平均分给4人？\nA.2个\nB.3个\nC.4个X\nD.6个\n孩子选择：C\n订正：12÷4=3（个）\n正确答案：B","选择题：12个苹果平均分给4人？\nA. 2个　B. 3个　C. 4个　D. 6个\n**孩子答案：C**"),
-            ("worksheet","# 图片错题（题目与孩子答案）\n归属：梁子航\n1.8.64÷1.2\n孩子答案：0.72","8.64÷1.2\n**孩子答案：0.72**"),
-        ] {
-            let imported=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":source,"text":text})).await.unwrap();
-            assert_eq!(imported["count"],1);
-            let page=e.list(ListQuery::default()).await.unwrap();
-            let item=page.items.iter().find(|m|m.id.to_string()==imported["ids"][0].as_str().unwrap()).unwrap();
-            assert_eq!(item.content,expected);assert_eq!(item.metadata["answer"],"");
-            let original=item.metadata["original_text"].as_str().unwrap();
-            assert!(!original.contains("正确答案"));assert!(!original.contains("解析"));assert!(!original.contains("答错"));
-            assert!(!item.content.contains("解析"));assert!(!item.content.contains("答错"));
-        }
-        let right=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"observed-right","text":"# 错题原文（仅转录）\n归属：梁子航\n1.3×3=9"})).await.unwrap();
-        assert_eq!(right["count"],1);assert_eq!(right["skipped_correct"],0);
-    }
-    #[tokio::test]
-    async fn old_arithmetic_switch_round_trip_updates_one_record_and_removes_old_details() {
-        let dir=tempfile::tempdir().unwrap();
-        let e=crate::MemoryEngine::builder().db_path(dir.path().join("switch.db")).build().await.unwrap();
-        let mut original_id=String::new();
-        for (i,enabled) in [false,true,false].into_iter().enumerate() {
-            let result=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":format!("switch-{i}"),"calculate_arithmetic_answers":enabled,
-                "text":"# 错题原文（仅转录）\n归属：梁子航\n1.2×2=40 答错"})).await.unwrap();
+            let result=e.wrong_practice(json!({"action":"import","text":text,"source_id":format!("image:{i}"),"kind":"image_ocr"})).await.unwrap();
             assert_eq!(result["count"],1);
-            let id=result["ids"][0].as_str().unwrap();if i==0 {original_id=id.into();}else{assert_eq!(id,original_id);}
-            let page=e.list(ListQuery::default()).await.unwrap();assert_eq!(page.total,1);let item=&page.items[0];
-            assert_eq!(item.metadata["answer"],if enabled {"4"}else{""});
-            assert_eq!(item.content.contains("正确答案"),enabled);
-            if !enabled {assert!(item.metadata.get("previous_original_text").is_none());assert!(!item.metadata["original_text"].as_str().unwrap().contains("答错"));}
+            let conn=Connection::open(&path).unwrap();
+            let row=store::get_memory(&conn,Uuid::parse_str(result["ids"][0].as_str().unwrap()).unwrap()).unwrap().unwrap();
+            assert_eq!(row.content,expected);
+            assert_shape(&row);
         }
     }
-
+    #[tokio::test]
+    async fn repeated_upload_updates_one_id_and_latest_tool_has_only_id_and_content() {
+        let (_d, e, path) = setup().await;
+        let text = "# 图片错题（题目与孩子答案）\n归属：梁子航\n1.8.64÷1.2\n孩子答案：0.72";
+        let mut ids = Vec::new();
+        for i in 1..=2 {
+            let r=e.wrong_practice(json!({"action":"import","text":text,"kind":"image_ocr","source_id":format!("page{i}"),"upload_id":format!("batch{i}"),"uploaded_at_ms":i})).await.unwrap();
+            ids.push(r["ids"][0].clone());
+        }
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(
+            load(&Connection::open(path).unwrap(), "default")
+                .unwrap()
+                .len(),
+            1
+        );
+        let latest = e
+            .wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"}))
+            .await
+            .unwrap();
+        assert_eq!(latest["upload_id"], "batch2");
+        let q = latest["questions"][0].as_object().unwrap();
+        assert_eq!(q.len(), 2);
+        assert!(q.contains_key("question_id") && q.contains_key("content"));
+        assert!(e
+            .wrong_practice(
+                json!({"action":"latest_uploaded_questions","name":"梁子航","tags":["除法题"]})
+            )
+            .await
+            .is_err());
+        let deleted=e.wrong_practice(json!({"action":"delete_question","name":"梁子航","question":"8.64÷1.2","question_id":ids[0]})).await.unwrap();
+        assert_eq!(deleted["deleted"], true);
+        assert_eq!(
+            e.wrong_practice(json!({"action":"latest_uploaded_questions","name":"梁子航"}))
+                .await
+                .unwrap()["ok"],
+            false
+        );
+    }
+    #[tokio::test]
+    async fn malformed_or_empty_answers_are_preserved_without_solving() {
+        let (_d, e, _path) = setup().await;
+        for (i, child) in ["", "未作答", "[无法辨认]", "abc不规范算式"]
+            .iter()
+            .enumerate()
+        {
+            let r=e.wrong_practice(json!({"action":"import","text":format!("错题\n姓名：梁子航\n1.测试题{i}\n孩子答案：{child}"),"source_id":format!("empty{i}")})).await.unwrap();
+            assert_eq!(r["count"], 1);
+        }
+        assert_eq!(e.list(ListQuery::default()).await.unwrap().total, 4);
+    }
+    #[tokio::test]
+    async fn edit_keeps_full_answer_without_classifying_or_creating_graph_jobs() {
+        let (_d, e, path) = setup().await;
+        let r=e.wrong_practice(json!({"action":"import","text":"错题\n姓名：梁子航\n1.原题\n孩子答案：A","source_id":"edit"})).await.unwrap();
+        let id = Uuid::parse_str(r["ids"][0].as_str().unwrap()).unwrap();
+        e.revise(
+            id,
+            MemoryUpdate {
+                content: Some("新题\n**孩子答案：** 第一步\n第二步\n答：错答。".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let conn = Connection::open(path).unwrap();
+        let row = store::get_memory(&conn, id).unwrap().unwrap();
+        assert_shape(&row);
+        assert_eq!(row.metadata["child_answer"], "第一步\n第二步\n答：错答。");
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM graph_projection_jobs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[tokio::test]
+    async fn retrieval_counts_all_questions_and_never_judges_from_a_stored_answer() {
+        let (_d, e, _path) = setup().await;
+        e.wrong_practice(json!({"action":"import","text":"错题\n姓名：梁子航\n1.9.36÷1.2\n孩子答案：0.78","source_id":"turn"})).await.unwrap();
+        let count = e
+            .wrong_practice(json!({"action":"turn","query":"梁子航有几道错题","session_id":"s"}))
+            .await
+            .unwrap();
+        assert_eq!(count["reply"], "错题集共1道。");
+        let q=e.wrong_practice(json!({"action":"turn","query":"给梁子航出一道错题","session_id":"s","message_id":"one"})).await.unwrap();
+        assert!(q["question_id"].is_string());
+        assert!(!q["reply"].as_str().unwrap().contains("0.78"));
+        assert_eq!(e.wrong_practice(json!({"action":"turn","query":"给梁子航出一道错题","session_id":"s","message_id":"one"})).await.unwrap()["question_id"],q["question_id"]);
+        assert_eq!(
+            e.wrong_practice(json!({"action":"turn","query":"7.8","session_id":"s"}))
+                .await
+                .unwrap()["handled"],
+            false
+        );
+    }
 }

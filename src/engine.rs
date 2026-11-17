@@ -2537,7 +2537,7 @@ impl MemoryEngine {
                         rec.tag="错题集".into();
                         rec.metadata=household::apply_tag(&rec.metadata,"错题集");
                         if before.metadata["practice_kind"]=="question" && before.content!=rec.content {
-                            crate::wrong_practice::relabel_edited_question(&mut rec,update.metadata.as_ref());
+                            crate::wrong_practice::refresh_edited_question(&mut rec);
                         }
                     } else if content_changed || rec.tag.trim().is_empty() || update.metadata.is_some() {
                         let ns_tag = rec.namespace.clone();

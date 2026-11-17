@@ -94,7 +94,5 @@ pub mod wrong_practice;
 mod simple_preferences;
 mod turn_control;
 mod memory_rules;
-mod question_rules;
-mod arithmetic;
 
 mod family_demo;
