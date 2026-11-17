@@ -202,6 +202,13 @@ fn question(text: &str) -> String {
         .to_string()
 }
 // 同题重传允许题干的常见等价说法与批改痕迹不同，保留最新原文及上一版来源。
+// 图片观察正文已经由调用方分题；保留全部作答行，不以答案语法或占位词拒绝落盘。
+fn observed_child_answer(text: &str, heading: &str) -> String {
+    if let Some(found) = Regex::new(r"孩子答案[：:]").unwrap().find(text) {
+        return text[found.end()..].trim().trim_end_matches('*').trim().to_string();
+    }
+    child_answer(text, heading)
+}
 fn child_answer(text: &str, heading: &str) -> String {
     if let Some(c) = Regex::new(r"孩子(?:选择|答案)[：:][ \t]*([^\n　]*)")
         .unwrap()
@@ -658,7 +665,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         if calculate_image && calculated.is_none() {
             return Err(crate::error::MemoraError::InvalidState("数学表达式无效、超出支持范围或无法安全计算".into()));
         }
-        if image && calculated.is_none() && choice_spans(&question(&q)).len() >= 2 {
+        if image && !observation_image && calculated.is_none() && choice_spans(&question(&q)).len() >= 2 {
             let selected = child_answer(&q, heading);
             if !["A", "B", "C", "D"].contains(&selected.as_str()) {
                 return Err(crate::error::MemoraError::InvalidState("孩子答案未辨认，不能保存为已作答错题".into()));
@@ -675,17 +682,11 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         } else if observation_image {
             let child;
             if text.starts_with("# 错题原文（仅转录）") {
-                let (left, right) = equation.split_once('=').ok_or_else(||crate::error::MemoraError::InvalidState("算式转录缺少等号".into()))?;
-                if !Regex::new(r"^[0-9.()（）+\-−×÷*/xX\s]+$").unwrap().is_match(left)
-                    || !Regex::new(r"^[+\-−]?(?:\d+(?:\.\d+)?|\.\d+)$").unwrap().is_match(right.trim()) {
-                    return Err(crate::error::MemoraError::InvalidState("题目或孩子答案转录不完整".into()));
-                }
-                child = right.trim().to_string();
-                q = format!("{}\n孩子答案：{}", left.trim(), child);
-            } else { child = child_answer(&q, heading); }
-            if text.starts_with("# 图片错题（题目与孩子答案）") && (child.is_empty() || has(&child, &["没答上", "未作答", "无法辨认"])) {
-                return Err(crate::error::MemoraError::InvalidState("孩子答案缺失，不能保存".into()));
-            }
+                if let Some((left, right)) = equation.split_once('=') {
+                    child = right.trim().to_string();
+                    q = format!("{}\n孩子答案：{}", left.trim(), child);
+                } else { child = observed_child_answer(&q, heading); }
+            } else { child = observed_child_answer(&q, heading); }
             q = compact_record_for_source(&q, "", &child, true);
             q = Regex::new(r"(?s)　解析：.*$").unwrap().replace(&q, "").to_string();
             (String::new(), child)
@@ -2183,6 +2184,31 @@ mod dual_image_protocol_tests {
 #[cfg(test)]
 mod observation_image_tests {
     use super::*;
+    #[tokio::test]
+    async fn observed_solution_keeps_all_lines_and_accepts_malformed_answers() {
+        let dir=tempfile::tempdir().unwrap();
+        let e=crate::MemoryEngine::builder().db_path(dir.path().join("solution.db")).build().await.unwrap();
+        let child="答：(46-18×2)÷(3-2)=8（辆）\n18-8=10（辆）\n自行车10辆，三轮车8辆。";
+        let text=format!("# 图片错题（题目与孩子答案）\n归属：梁子航\n1.停车场18辆46轮，两种车各多少？\n孩子答案：{child}");
+        let r=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"full-solution","text":text})).await.unwrap();
+        let page=e.list(ListQuery::default()).await.unwrap();
+        let item=page.items.iter().find(|m|m.id.to_string()==r["ids"][0].as_str().unwrap()).unwrap();
+        assert_eq!(item.metadata["child_answer"],child);
+        assert!(item.content.contains(child));
+        let second=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"full-solution-repeat","text":text})).await.unwrap();
+        assert_eq!(r["ids"],second["ids"]);
+        for (i,answer) in ["[无法辨认]\n不合法的算式=？", "", "没答上"].iter().enumerate() {
+            let raw=format!("# 图片错题（题目与孩子答案）\n归属：梁子航\n1.原始题面{i}\n孩子答案：{answer}");
+            let imported=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":format!("malformed-{i}"),"text":raw})).await.unwrap();
+            assert_eq!(imported["count"],1);
+            let page=e.list(ListQuery::default()).await.unwrap();
+            let record=page.items.iter().find(|m|m.id.to_string()==imported["ids"][0].as_str().unwrap()).unwrap();
+            assert_eq!(record.metadata["child_answer"],*answer);
+        }
+        let old=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"malformed-old","text":"# 错题原文（仅转录）\n归属：梁子航\n1.算式=不合法?"})).await.unwrap();
+        assert_eq!(old["count"],1);
+    }
+
     #[tokio::test]
     async fn default_off_preserves_observed_child_without_answer_or_explanation() {
         let dir=tempfile::tempdir().unwrap();
