@@ -300,6 +300,7 @@ fn compact_record_for_source(text: &str, correct: &str, child: &str, image: bool
 }
 fn question_key(text: &str) -> String {
     let stem = question(text).replace("每个小朋友分到几个苹果", "每人分到几个");
+    let stem = Regex::new(r"^(?:加法题|减法题|加减法题|乘法题|除法题|乘除法题|算术题)\s+").unwrap().replace(&stem, "");
     let stem = Regex::new(r"^\s*\d+[.．、。]\s*(?:选择题[：:]\s*)?")
         .unwrap()
         .replace(&stem, "");
@@ -642,11 +643,15 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
         } else {
             resolved_question_labels(&body["question_labels"][number.to_string()],raw_q,heading)
         };
-        // 只把程序证实答错的有效表达式保存为错题，OCR批改结论不作为判题依据。
+        // 旧单题口算显式开启时才判题；观察模式不计算，只保留题面和实际作答。
         let equation = Regex::new(r"^\d+[.．、。]\s*").unwrap().replace(raw_q, "");
         let equation = equation.trim().strip_suffix("答错").unwrap_or(equation.trim()).trim();
-        let calculated = crate::arithmetic::check(equation);
-        if image && text.starts_with("# 错题原文（仅转录）") && calculated.is_none() {
+        // 新的多题图片永不计算；旧单道口算只在调用方明确打开开关时计算。
+        let observation_image = image && ["# 错题原文（仅转录）", "# 图片错题（圈选）", "# 图片错题（题目与孩子答案）"].iter().any(|header|text.starts_with(header));
+        let calculate_image = image && text.starts_with("# 错题原文（仅转录）")
+            && body["calculate_arithmetic_answers"].as_bool().unwrap_or(false);
+        let calculated = if !observation_image || calculate_image { crate::arithmetic::check(equation) } else { None };
+        if calculate_image && calculated.is_none() {
             return Err(crate::error::MemoraError::InvalidState("数学表达式无效、超出支持范围或无法安全计算".into()));
         }
         if image && calculated.is_none() && choice_spans(&question(&q)).len() >= 2 {
@@ -663,11 +668,31 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
             classification = json!({"question_types":checked.tags,"question_label_source":"program","question_label_reason":"parsed_arithmetic_expression"});
             q = format!("{} {}\n**孩子答案：{}　正确答案：{}**", checked.question_type, checked.expression, checked.child_answer, checked.correct_answer);
             (checked.correct_answer.clone(), checked.child_answer.clone())
+        } else if observation_image {
+            let child;
+            if text.starts_with("# 错题原文（仅转录）") {
+                let (left, right) = equation.split_once('=').ok_or_else(||crate::error::MemoraError::InvalidState("算式转录缺少等号".into()))?;
+                if !Regex::new(r"^[0-9.()（）+\-−×÷*/xX\s]+$").unwrap().is_match(left)
+                    || !Regex::new(r"^[+\-−]?(?:\d+(?:\.\d+)?|\.\d+)$").unwrap().is_match(right.trim()) {
+                    return Err(crate::error::MemoraError::InvalidState("题目或孩子答案转录不完整".into()));
+                }
+                child = right.trim().to_string();
+                q = format!("{}\n孩子答案：{}", left.trim(), child);
+            } else { child = child_answer(&q, heading); }
+            if text.starts_with("# 图片错题（题目与孩子答案）") && (child.is_empty() || has(&child, &["没答上", "未作答", "无法辨认"])) {
+                return Err(crate::error::MemoraError::InvalidState("孩子答案缺失，不能保存".into()));
+            }
+            q = compact_record_for_source(&q, "", &child, true);
+            q = Regex::new(r"(?s)　解析：.*$").unwrap().replace(&q, "").to_string();
+            (String::new(), child)
         } else {
             let a = answer(&q); let child = child_answer(&q, heading);
             q = compact_record_for_source(&q, &a, &child, image);
             (a, child)
         };
+        let only_observed = observation_image && !calculate_image;
+        let observed_original = q.replace("**", "");
+        let stored_original = if only_observed { observed_original.as_str() } else { raw_q };
         if let Some(old) = existing.iter().find(|old| {
             old.number == number
                 && (old.meta["source_id"] == source || question_key(&old.raw) == question_key(&q)
@@ -682,8 +707,10 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
                 rec.metadata["latest_source_id"] = json!(source);
                 rec.metadata["latest_upload_id"] = json!(body["upload_id"].as_str().unwrap_or(source));
                 rec.metadata["source_order"] = json!(body["source_order"].as_i64().unwrap_or(0));
-                rec.metadata["previous_original_text"] = rec.metadata["original_text"].clone();
-                rec.metadata["original_text"] = json!(raw_q);
+                if only_observed {
+                    if let Some(meta) = rec.metadata.as_object_mut() { meta.remove("previous_original_text"); }
+                } else { rec.metadata["previous_original_text"] = rec.metadata["original_text"].clone(); }
+                rec.metadata["original_text"] = json!(stored_original);
                 rec.metadata["source_name"] = body["name"].clone();
                 rec.metadata["image"] = json!(image);
                 for key in ["question_types","question_label_source","question_label_reason"] {rec.metadata[key]=classification[key].clone();}
@@ -698,7 +725,7 @@ fn import(tx: &Connection, ns: &str, jieba: &jieba_rs::Jieba, body: &Value) -> R
             count += 1;
             continue;
         }
-        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":classification["question_types"],"question_label_source":classification["question_label_source"],"question_label_reason":classification["question_label_reason"],"arithmetic_labels_version":1,"answer":a,"child_answer":child,"weight":1.0,"source_id":source,"latest_source_id":source,"latest_upload_id":body["upload_id"].as_str().unwrap_or(source),"source_order":body["source_order"].as_i64().unwrap_or(0),"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":raw_q,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
+        let meta = json!({"practice_kind":"question","channel":"wrong_practice","subjects":[{"member_id":owner,"confidence":1.0}],"number":number,"question_types":classification["question_types"],"question_label_source":classification["question_label_source"],"question_label_reason":classification["question_label_reason"],"arithmetic_labels_version":1,"answer":a,"child_answer":child,"weight":1.0,"source_id":source,"latest_source_id":source,"latest_upload_id":body["upload_id"].as_str().unwrap_or(source),"source_order":body["source_order"].as_i64().unwrap_or(0),"uploaded_at_ms":body["uploaded_at_ms"].as_i64().unwrap_or_else(now_ms),"source_name":body["name"],"original_text":stored_original,"answer_correction":if q.contains("千锤万凿出深山"){json!("资料答案勘误：粉骨碎身浑不怕")}else{Value::Null},"image":image});
         let id = record(tx, ns, jieba, &owner, &q, meta, None)?;
         ids.push(id);
         count += 1;
@@ -2035,7 +2062,7 @@ mod calculated_math_tests {
         (dir,engine)
     }
     fn input(equation: &str, source: &str)->Value {
-        json!({"action":"import","text":format!("# 错题原文（仅转录）\n归属：梁子航\n1.{equation} 答错"),"source_id":source,"kind":"image_ocr",
+        json!({"action":"import","text":format!("# 错题原文（仅转录）\n归属：梁子航\n1.{equation} 答错"),"source_id":source,"kind":"image_ocr","calculate_arithmetic_answers":true,
             "question_labels":{"1":{"question_types":["数学题","除法题"],"question_label_source":"edge_model"}}})
     }
     #[tokio::test] async fn program_supplies_answer_type_and_preset_format_without_explanation() {
@@ -2104,7 +2131,7 @@ mod dual_image_protocol_tests {
             ("arithmetic","# 错题原文（仅转录）\n归属：梁子航\n1.2×2=40 答错"),
             ("choice","# 图片错题（圈选）\n归属：梁子航\n数学错题整理\n1.选择题：12个苹果平均分给4人，每人几个？\nA.2个\nB.3个\nC.4个X\nD.6个\n孩子选择：C"),
         ] {
-            let result=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":source,"text":text})).await.unwrap();
+            let result=e.wrong_practice(json!({"action":"import","kind":"image_ocr","calculate_arithmetic_answers":true,"source_id":source,"text":text})).await.unwrap();
             assert_eq!(result["count"],1);assert_eq!(result["owner"],"梁子航");
         }
         let page=e.list(ListQuery::default()).await.unwrap();assert_eq!(page.total,2);
@@ -2114,8 +2141,51 @@ mod dual_image_protocol_tests {
         assert!(!choice.content.contains("4个X"));assert!(choice.content.contains("**孩子答案：C**"));
         assert!(!choice.content.contains("正确答案"));assert!(!choice.content.contains("解析"));
         assert_eq!(math.metadata["subjects"],choice.metadata["subjects"]);
-        let correct=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"right","text":"# 错题原文（仅转录）\n归属：梁子航\n1.2×2=4 答错"})).await.unwrap();
+        let correct=e.wrong_practice(json!({"action":"import","kind":"image_ocr","calculate_arithmetic_answers":true,"source_id":"right","text":"# 错题原文（仅转录）\n归属：梁子航\n1.2×2=4 答错"})).await.unwrap();
         assert_eq!(correct["count"],0);assert_eq!(correct["skipped_correct"],1);
         assert_eq!(e.list(ListQuery::default()).await.unwrap().total,2);
     }
+}
+
+#[cfg(test)]
+mod observation_image_tests {
+    use super::*;
+    #[tokio::test]
+    async fn default_off_preserves_observed_child_without_answer_or_explanation() {
+        let dir=tempfile::tempdir().unwrap();
+        let e=crate::MemoryEngine::builder().db_path(dir.path().join("observed.db")).build().await.unwrap();
+        for (source,text,expected) in [
+            ("old_math","# 错题原文（仅转录）\n归属：梁子航\n1.2×2=40","2×2\n**孩子答案：40**"),
+            ("old_choice","# 图片错题（圈选）\n归属：梁子航\n1.选择题：12个苹果平均分给4人？\nA.2个\nB.3个\nC.4个X\nD.6个\n孩子选择：C\n订正：12÷4=3（个）\n正确答案：B","选择题：12个苹果平均分给4人？\nA. 2个　B. 3个　C. 4个　D. 6个\n**孩子答案：C**"),
+            ("worksheet","# 图片错题（题目与孩子答案）\n归属：梁子航\n1.8.64÷1.2\n孩子答案：0.72","8.64÷1.2\n**孩子答案：0.72**"),
+        ] {
+            let imported=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":source,"text":text})).await.unwrap();
+            assert_eq!(imported["count"],1);
+            let page=e.list(ListQuery::default()).await.unwrap();
+            let item=page.items.iter().find(|m|m.id.to_string()==imported["ids"][0].as_str().unwrap()).unwrap();
+            assert_eq!(item.content,expected);assert_eq!(item.metadata["answer"],"");
+            let original=item.metadata["original_text"].as_str().unwrap();
+            assert!(!original.contains("正确答案"));assert!(!original.contains("解析"));assert!(!original.contains("答错"));
+            assert!(!item.content.contains("解析"));assert!(!item.content.contains("答错"));
+        }
+        let right=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":"observed-right","text":"# 错题原文（仅转录）\n归属：梁子航\n1.3×3=9"})).await.unwrap();
+        assert_eq!(right["count"],1);assert_eq!(right["skipped_correct"],0);
+    }
+    #[tokio::test]
+    async fn old_arithmetic_switch_round_trip_updates_one_record_and_removes_old_details() {
+        let dir=tempfile::tempdir().unwrap();
+        let e=crate::MemoryEngine::builder().db_path(dir.path().join("switch.db")).build().await.unwrap();
+        let mut original_id=String::new();
+        for (i,enabled) in [false,true,false].into_iter().enumerate() {
+            let result=e.wrong_practice(json!({"action":"import","kind":"image_ocr","source_id":format!("switch-{i}"),"calculate_arithmetic_answers":enabled,
+                "text":"# 错题原文（仅转录）\n归属：梁子航\n1.2×2=40 答错"})).await.unwrap();
+            assert_eq!(result["count"],1);
+            let id=result["ids"][0].as_str().unwrap();if i==0 {original_id=id.into();}else{assert_eq!(id,original_id);}
+            let page=e.list(ListQuery::default()).await.unwrap();assert_eq!(page.total,1);let item=&page.items[0];
+            assert_eq!(item.metadata["answer"],if enabled {"4"}else{""});
+            assert_eq!(item.content.contains("正确答案"),enabled);
+            if !enabled {assert!(item.metadata.get("previous_original_text").is_none());assert!(!item.metadata["original_text"].as_str().unwrap().contains("答错"));}
+        }
+    }
+
 }
